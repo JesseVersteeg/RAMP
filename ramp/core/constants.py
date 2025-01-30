@@ -104,6 +104,14 @@ APPLIANCE_ATTRIBUTES = (
     "window_2",
     "window_3",
     "random_var_w",
+    "distance_total",
+    "randomised_distance",
+    "randomised_velocity",
+    "distance_minimal",
+    "power_variables",
+    "parameters_power",
+    "battery_capacity",
+    "location"
 )
 
 APPLIANCE_ARGS = (
@@ -123,6 +131,15 @@ APPLIANCE_ARGS = (
     "pref_index",
     "wd_we_type",
     "name",
+    "test",
+    "distance_total",
+    "randomised_distance",
+    "randomised_velocity",
+    "distance_minimal",
+    "power_variables",
+    "parameters_power",
+    "battery_capacity",
+    "location",
 )
 
 MAX_WINDOWS = 3

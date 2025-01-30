@@ -610,6 +610,7 @@ class UseCase:
                 for k in APPLIANCE_ARGS:
                     if k in row:
                         appliance_parameters[k] = row[k]
+                    print(appliance_parameters)
 
                 # assign windows arguments
                 for k in WINDOWS_PARAMETERS:
@@ -939,6 +940,13 @@ appliances: no appliances assigned to the user.
         pref_index=0,
         wd_we_type=2,
         name="",
+        distance_total: float = 0,
+        randomised_distance: float = 0.3,
+        randomised_velocity: float = 0.3,
+        distance_minimal: float = 0,
+        power_parameters: list = [0.35, -15.2, 620],
+        battery_capacity: int = 100,
+        location: str = None
     ):
         """Back-compatibility with legacy code
 
@@ -967,6 +975,14 @@ appliances: no appliances assigned to the user.
             pref_index=pref_index,
             wd_we_type=wd_we_type,
             name=name,
+            distance_total=distance_total,
+            randomised_distance=randomised_distance,
+            randomised_velocity=randomised_velocity,
+            distance_minimal=distance_minimal,
+            power_parameters=power_parameters,
+            battery_capacity=battery_capacity,
+            location=location,
+            #add here the constant attributes?
         )
 
     def generate_single_load_profile(
@@ -1074,6 +1090,13 @@ class Appliance:
         pref_index: int = 0,
         wd_we_type: int = 2,
         name: str = "",
+        distance_total: float = 0.0,
+        randomised_distance: float = 0.3,
+        randomised_velocity: float = 0.3,
+        distance_minimal: float = 0,
+        power_parameters: list = [0.35, -15.2, 620],
+        battery_capacity: int = 100,
+        location: str = "",
     ):
         """Creates an appliance for a given user
 
@@ -1161,6 +1184,13 @@ class Appliance:
         self.thermal_p_var = thermal_p_var
         self.pref_index = pref_index
         self.wd_we_type = wd_we_type
+        self.distance_total = distance_total
+        self.randomised_distance = randomised_distance
+        self.randomised_velocity = randomised_velocity
+        self.distance_minimal = distance_minimal,
+        self.power_parameters = power_parameters
+        self.battery_capacity = battery_capacity
+        self.location = location
 
         self.__constant_power = False
 
