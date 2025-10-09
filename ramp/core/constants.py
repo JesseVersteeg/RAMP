@@ -104,14 +104,21 @@ APPLIANCE_ATTRIBUTES = (
     "window_2",
     "window_3",
     "random_var_w",
+    "car_type",
+    "user_type",
     "distance_total",
-    "randomised_distance",
-    "randomised_velocity",
+    "distance_random_variability",
+    "velocity_random_variability",
+    "power_random_variability",
     "distance_minimal",
     "power_variables",
     "parameters_power",
     "battery_capacity",
-    "location"
+    "location",
+    "location_preference_factor",
+    "electric_vehicle",
+    "minimum_waiting_time",
+    "charging_strategy",
 )
 
 APPLIANCE_ARGS = (
@@ -131,15 +138,21 @@ APPLIANCE_ARGS = (
     "pref_index",
     "wd_we_type",
     "name",
-    "test",
+    "car_type",
+    "user_type",
     "distance_total",
-    "randomised_distance",
-    "randomised_velocity",
+    "distance_random_variability",
+    "velocity_random_variability",
+    "power_random_variability",
     "distance_minimal",
     "power_variables",
     "parameters_power",
     "battery_capacity",
     "location",
+    "location_preference_factor",
+    "electric_vehicle",
+    "minimum_waiting_time",
+    "charging_strategy"
 )
 
 MAX_WINDOWS = 3
