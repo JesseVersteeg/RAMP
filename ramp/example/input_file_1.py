@@ -281,17 +281,21 @@ if __name__ == "__main__":
     uc = UseCase(
         users=User_list,
         parallel_processing=False,
+        random_seed = 1000
     )
-    uc.initialize(peak_enlarge=0.15)
+    uc.initialize(num_days=5,peak_enlarge=0.15)
 
     Profiles_list = uc.generate_daily_load_profiles(flat=False)
+    print(Profiles_list)
 
+    
     # post-processing
     from ramp.post_process import post_process as pp
 
     Profiles_avg, Profiles_list_kW, Profiles_series = pp.Profile_formatting(
         Profiles_list
     )
+
     pp.Profile_series_plot(
         Profiles_series
     )  # by default, profiles are plotted as a series

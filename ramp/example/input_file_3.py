@@ -28,7 +28,7 @@ HH_lunch1_soup = HH.add_appliance(
     number=1,
     power=1800,
     num_windows=2,
-    func_time=70,
+    func_time=50,
     time_fraction_random_variability=0.15,
     func_cycle=60,
     thermal_p_var=0.2,
@@ -36,7 +36,10 @@ HH_lunch1_soup = HH.add_appliance(
     fixed_cycle=1,
     name="lunch1_soup",
 )
-HH_lunch1_soup.windows(window_1=[12 * 60, 15 * 60], window_2=[0, 0], random_var_w=0.15)
+
+
+
+HH_lunch1_soup.windows(window_1=[12 * 60, 15 * 60], window_2=[500, 600], random_var_w=0.15)
 HH_lunch1_soup.specific_cycle_1(p_11=1800, t_11=10, p_12=750, t_12=60, r_c1=0.15)
 HH_lunch1_soup.cycle_behaviour(cw11=[12 * 60, 15 * 60], cw12=[0, 0])
 
@@ -177,7 +180,7 @@ if __name__ == "__main__":
         users=User_list,
         parallel_processing=False,
     )
-    uc.initialize(peak_enlarge=0.15)
+    uc.initialize(num_days= 20,peak_enlarge=0.15)
 
     Profiles_list = uc.generate_daily_load_profiles(flat=False)
 

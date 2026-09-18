@@ -13,15 +13,22 @@ import warnings
 import random
 import math
 import datetime
-from ramp.core.constants import (
+from collections import Counter, defaultdict 
+from bisect import bisect_right
+import sys #temporary for path
+import os  #temporary for path
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) #temporary for path
+from core.constants import (
     NEW_TO_OLD_MAPPING,
     APPLIANCE_ATTRIBUTES,
     APPLIANCE_ARGS,
+    EV_SPECIFIC_PARAMS,
     WINDOWS_PARAMETERS,
     DUTY_CYCLE_PARAMETERS,
     switch_on_parameters,
 )
-from ramp.core.utils import (
+from core.utils import (
     get_day_type,
     random_variation,
     duty_cycle,
@@ -30,11 +37,12 @@ from ramp.core.utils import (
     within_peak_time_window,
     range_within_window,
 )
-from ramp.post_process.post_process import Plot
+
+from post_process.post_process import Plot
 
 
 from typing import List, Union, Iterable
-from ramp.errors_logs.errors import InvalidType, InvalidWindow
+from errors_logs.errors import InvalidType, InvalidWindow
 
 
 def single_appliance_daily_load_profile(args):
@@ -57,6 +65,7 @@ class UseCase:
         parallel_processing: bool = False,
         peak_enlarge: float = 0.15,
         random_seed: int = None,
+        country: str = None
     ):
         """Creates a UseCase instance for gathering a list of User instances which own Appliance instances
 
@@ -95,8 +104,14 @@ class UseCase:
         self.days = None
         self.__num_days = None
         self.__datetimeindex = None
-        self.daily_profiles = None
         self.random_seed = random_seed
+        self._year = self._date_start.year
+        self._country = country
+        self.mobility = None
+        if self._country is not None:
+            from .mobility_config import MobilityConfig
+            self.mobility = MobilityConfig(self._country, self._year)
+        
 
         self.appliances = []
         self.users = []
@@ -416,7 +431,7 @@ class UseCase:
                 )
             answer = Plot(pd.concat(results, axis=1))
         else:
-            if self.days is None:
+            if self.days is None: 
                 if days is not None:
                     self.days = days  # TODO this might be wrong need to update the date_start, end num_days etc
                 else:
@@ -449,6 +464,7 @@ class UseCase:
                 answer = daily_profiles.reshape(1, self.num_days * 1440).squeeze()
             else:
                 answer = daily_profiles
+                
         return answer
 
     def generate_daily_load_profiles_parallel(self, days=None, flat=True):
@@ -610,7 +626,7 @@ class UseCase:
                 for k in APPLIANCE_ARGS:
                     if k in row:
                         appliance_parameters[k] = row[k]
-                    print(appliance_parameters)
+                    
 
                 # assign windows arguments
                 for k in WINDOWS_PARAMETERS:
@@ -644,8 +660,258 @@ class UseCase:
                 user.add_appliance(**appliance_parameters)
 
         self.collect_appliances_from_users()
+    
+    #this functions calculates the mobility locations.
+    def ev_locations(self):
+
+        #mapping to store it in a 2D array. This allows for full year simulation. 
+        LOCATION_MAP = {
+            "Home": 0,
+            "Work/Study": 1,
+            "Errands": 2,
+            "Leisure": 3,
+            "traveling": 4,
+        }
+
+        time_duration = len(self.days) * 1440
+
+        temp_profiles = []
+
+        for App in self.appliances:
+            n_users = len(App.locations_total)
+            mobility_location_profile = np.full((time_duration, n_users), LOCATION_MAP["Home"], dtype=np.uint8)
+            
+            for col, (ev, intervals) in enumerate(App.locations_total.items()):
+                for start, end, location in intervals:
+                    end = min(end, time_duration - 1)
+                    mobility_location_profile[start:end+1, col] = LOCATION_MAP[location]
+
+            temp_profiles.append(mobility_location_profile)
+
+        #returns 2D np.array of size minutes(rows) x #users(columns) with mapping value of the location
+        #this is a solution to accomodate full year profiles, otherwise it exceeds the memory storage.
+        location_profiles = np.concatenate(temp_profiles, axis=1) 
+        
+        return location_profiles
+    
+    def generate_daily_charging_profiles(self, charging_mode = 'Uncontrolled', logistic = False, infr_prob = 0.8, Ch_stations = None, SOC_initial=0.8):
+
+        #SOC value at the beginning of the simulation, relevant only for
+        # Perfect Foresight charging strategy, as is the maximum SOC that the car will always try to go back to
+        SOC_initial = SOC_initial
+        SOC_min_rand = 0.5 # Minimum SOC level with which the car can start the simulation
+
+        # Definition of battery limits to avoid degradation
+        SOC_max = 0.8 # Maximum SOC at which the battery is charged
+        SOC_min = 0.20# Minimum SOC level that forces the charging event
+        
+        eff = 0.90  # Charging/discharging efficiency
+        
+        # Calculate the number of users in simulation for screen update
+        tot_users = len(self.users) #move to user method
+
+        LOCATION_MAP = {
+            "Home": 1,
+            "Work/Study": 2,
+            "Errands": 3,
+            "Leisure": 4,
+        }
+            
+        # Check that the charging mode is one of the expected ones
+        charging_mode_types = ['Uncontrolled', 'Night Charge', 'RES Integration', 'Perfect Foresight', 'Plan-day-ahead']
+        assert charging_mode in charging_mode_types, f"[WARNING] Invalid Charging Mode. Expected one of: {charging_mode_types}"
+        
+        # get residual load: 
+        if 'RES Integration' in charging_mode:
+            residual_load_data = self.mobility.residual_load_data
+            if residual_load_data.empty:
+                raise ValueError("[WARNING] RES Integration detected as charging strategy, but the residual load file is not found. Please provide a csv file containing the residual load curve.")                        
+        
+        # Check that the initial SOC is in the expected way
+        if (SOC_initial != 'random' and 
+            not isinstance(SOC_initial, (int, float))): 
+                raise ValueError(f"[WARNING] Invalid SOC initial. Expected either 'random', or a value between {SOC_min} and 1")                    
+
+        # Check that the infrastructure probability is in the expected way
+        if (infr_prob != 'piecewise' and 
+            not isinstance(infr_prob, (int, float))): 
+                raise ValueError("[WARNING] Invalid Infrastructure probability. Expected etiher 'piecewise', or a value between 0 and 1")                        
+        
+        # Initialization of output variables
+        # Charging_profile_user = {}
+        # SOC_user = {}
+        # plug_in_user = {}
+        
+        num_us = 0
+
+        # Creation of date array
+        start_day = datetime.datetime(self.days[0].year, self.days[0].month, self.days[0].day)  #date start up or iterable in self.days[0]
+        n_periods = len(self.days) * 1440 #periods defined as len(days) * 1440
+        minutes = pd.date_range(start=start_day, periods = n_periods, freq='min')
+
+        total_charging_profile = np.zeros(len(self.days)*1440) #dimensions of the days * 1440, thus len(self.days) * 1440
+        total_locational_load_profile = {location: np.zeros(n_periods, dtype=np.float32) for location in LOCATION_MAP.keys()}
 
 
+        # Check if introducing the logistic function for behavioural modeling
+        if logistic: # Probability of charging based on the SOC of the car 
+            ch_prob = self.mobility.charge_prob #only define ch_prob as the function. Later on ch_prob is used with the SOC argument, creating a value of the logistic function. Give this as argument to lower levels.
+        else: # The user will always try to charge (probability = 1 for every SOC)
+            ch_prob = self.mobility.charge_prob_const
+        
+        # Check which infrastructure probability function to use 
+        if infr_prob == 'piecewise': # Use of piecewise function based on hour of the day 
+            infrastructure_availability = self.mobility.infrastructure_availability #uses the dataframe from the settable infrastructure from the database
+            
+            #creates the piecewise function of all the locations
+            infr_pr = {location: ( infrastructure_availability.loc[location, "p"].reindex(range(24)).to_numpy()[minutes.hour])
+                for location in infrastructure_availability.index.get_level_values(0).unique()
+            }       
+
+            # import matplotlib.pyplot as plt
+            # n_locations = len(infr_pr)
+            # ncols = 2
+            # nrows = int(np.ceil(n_locations / ncols))
+
+            # fig, axes = plt.subplots(
+            #     nrows,
+            #     ncols,
+            #     figsize=(12, 3 * nrows),
+            #     sharex=True,
+            #     sharey=True,
+            # )
+
+            # axes = np.atleast_1d(axes).flatten()
+
+            # for ax, (location, profile) in zip(axes, infr_pr.items()):
+
+            #     hourly = profile[:1440].reshape(24, 60).mean(axis=1)
+            #     hourly = np.append(hourly, hourly[-1])
+
+            #     ax.step(np.arange(25), hourly, where="post", color="red")
+            #     ax.set_title(location)
+            #     ax.set_ylim(0, 1)
+            #     ax.set_xticks([0, 6, 12, 18, 24])
+            #     ax.grid(True, alpha=0.3)
+
+            # # hide unused axes
+            # for ax in axes[n_locations:]:
+            #     ax.set_visible(False)
+
+            # plt.tight_layout()
+            # plt.show()
+            
+        elif isinstance(infr_prob, (int, float)): # flat value for finding a charging point
+            infr_pr = np.ones(len(minutes)) * infr_prob
+            # assign flat infrastructure probabilites to all locations
+            infr_pr = {'Home':infr_pr,'Work/Study':infr_pr,'Errands':infr_pr,'Leisure':infr_pr}        
+        
+        #only exectute for EV_appliances
+        app_list_ev = [app for app in self.appliances if isinstance(app, Electric_Vehicle)]
+        for App in app_list_ev:
+            # concatenate all the daily profiles into a single total profile
+            # App.EV_users is a dictionary which contains the ID of the user and the daily profiles: {user_num:daily profiles of array 1440 for x amount of days}
+            App.EV_usage_total_days = {
+                user_num: np.concatenate(daily_profiles)
+                for user_num, daily_profiles in App.EV_users.items()
+                }
+            
+            # correction for the temporary value given in the windows functions
+            App.EV_usage_total_days = {
+                user_num: np.where(daily_profiles < 1, 0, daily_profiles) 
+                for user_num, daily_profiles in App.EV_usage_total_days.items()
+                }
+
+            # validation metric: average amount of travels per user per day
+            for _, daily_profiles in App.EV_users.items():
+                for day_idx, daily_profile in enumerate(daily_profiles):
+                    daily_profile = np.where(daily_profile < 0.1, 0, daily_profile)
+                    travel_indexes, _ = App.get_parking_indexes(daily_profile)
+                    App.travel_counts_by_day[day_idx].append(len(travel_indexes))
+        
+            # isolate only the travel indexes and store them in a dictionary. these are used to connect travel starting time to locations
+            for user_id, daily_profiles in App.EV_users.items():
+                for day_index, day_array in enumerate(daily_profiles):
+                    daily_array = np.where(day_array < 1, 0, day_array)
+                    travel_index_intervals, _ = App.get_parking_indexes(daily_array)
+                    travel_intervals = App.merge_consecutive_intervals(travel_index_intervals)
+                    App.daily_travel_intervals[user_id][day_index] = travel_intervals
+        
+        print('\nPlease wait for the charging profiles...') 
+
+        for user in self.users:
+            aggregated_user_load, aggregated_locational_load  = user.generate_aggregated_charging_profile(
+            SOC_max, SOC_min, SOC_min_rand, SOC_initial, infr_pr, ch_prob, self._country, minutes, eff, Ch_stations,charging_mode, n_periods, LOCATION_MAP=LOCATION_MAP
+            )
+
+            total_charging_profile = (
+                total_charging_profile + aggregated_user_load
+            ) #aggregate the user charging load to the usecase load
+
+            for loc in total_locational_load_profile:
+                total_locational_load_profile[loc] += aggregated_locational_load[loc]
+
+            num_us = num_us + 1
+            print(f'Charging Profile of "{user.user_name}" user completed ({num_us}/{tot_users})') 
+        
+        total_charging_profile = total_charging_profile.reshape((len(total_charging_profile) // 1440, 1440))
+        
+        return total_charging_profile, total_locational_load_profile
+
+    
+    #metric function
+    def daily_travel_counter(self):
+        combined_travel_counter = defaultdict(list)
+        for App in self.appliances:
+            for key in App.travel_counts_by_day:
+                combined_travel_counter[key].extend(App.travel_counts_by_day[key])
+
+        ctr = {k: Counter(v) for k,v in combined_travel_counter.items()} 
+        
+        return ctr
+    
+    #metric function
+    def mobility_and_charging_factor(self):
+        stack_list_mobility = []
+        stack_list_charging = []
+        for App in self.appliances:
+            for arr in App.charging_distribution:
+                stack_list_charging.append(arr) #this is list with arrays. We want only the arrays?
+            for arr in App.EV_usage_total_days.values():
+                stack_list_mobility.append(arr)
+        
+
+        for arr in stack_list_charging:
+            if arr.size == 0:
+                stack_list_charging.pop(arr)
+        for arr in stack_list_mobility:
+            if arr.size == 0:
+                stack_list_mobility.pop(arr)     
+
+        charging_total_stacked = np.vstack(stack_list_charging)
+        non_zero_charging = np.count_nonzero(charging_total_stacked, axis=0)
+        charging_coincidence = (non_zero_charging / charging_total_stacked.shape[0])
+
+        mobility_total_stacked = np.vstack(stack_list_mobility)
+        non_zero_mobility = np.count_nonzero(mobility_total_stacked, axis=0)
+        mobility_usage = (non_zero_mobility / mobility_total_stacked.shape[0])
+
+        total_charging_sessions = np.array([])
+        total_kwh_per_session = []
+        for app in self.appliances: 
+            total_charging_sessions = np.append(total_charging_sessions, app.length_of_charging_sessions)
+            total_kwh_per_session.extend(app.kwh_per_charging_session)
+            
+        if len(total_charging_sessions) > 0:
+            average_charging_sessions = total_charging_sessions.sum() / len(total_charging_sessions)
+        else:
+            average_charging_sessions = 0
+            
+        total_kwh_per_session = np.array(total_kwh_per_session)
+
+        return charging_coincidence, mobility_usage, total_kwh_per_session
+    
+    
 class User:
     def __init__(
         self,
@@ -661,7 +927,7 @@ class User:
         user_name : str, optional
             name of the user type, by default ""
         num_users : int, optional
-            number of users within the resprective user-type, by default 1
+            number of users within the respective user-type, by default 1
         user_preference : int {0,1,2,3}, optional
             Related to cooking behaviour, how many types of meal a user wants a day (number of user preferences has to be defined here and will be further specified with pref_index parameter), by default 0
         """
@@ -675,7 +941,7 @@ class User:
         self.App_list = (
             []
         )  # each instance of User (i.e. each user class) has its own list of Appliances
-
+    
     def __str__(self):
         try:
             return self.save()[
@@ -785,8 +1051,12 @@ appliances: no appliances assigned to the user.
                     cycle_parameters[k] = kwargs.pop(k)
             if cycle_parameters:
                 duty_cycle_parameters[i + 1] = cycle_parameters
-
-        app = Appliance(self, **kwargs)
+        
+        if any(param in kwargs for param in EV_SPECIFIC_PARAMS):
+        #if the appliance has EV specific parameters, recognize it as EV Appliance
+            app = Electric_Vehicle(self,**kwargs)
+        else:
+            app = Appliance(self,**kwargs)
 
         if windows_args:
             app.windows(**windows_args)
@@ -939,14 +1209,7 @@ appliances: no appliances assigned to the user.
         thermal_P_var=0,
         pref_index=0,
         wd_we_type=2,
-        name="",
-        distance_total: float = 0,
-        randomised_distance: float = 0.3,
-        randomised_velocity: float = 0.3,
-        distance_minimal: float = 0,
-        power_parameters: list = [0.35, -15.2, 620],
-        battery_capacity: int = 100,
-        location: str = None
+        name=""
     ):
         """Back-compatibility with legacy code
 
@@ -975,14 +1238,6 @@ appliances: no appliances assigned to the user.
             pref_index=pref_index,
             wd_we_type=wd_we_type,
             name=name,
-            distance_total=distance_total,
-            randomised_distance=randomised_distance,
-            randomised_velocity=randomised_velocity,
-            distance_minimal=distance_minimal,
-            power_parameters=power_parameters,
-            battery_capacity=battery_capacity,
-            location=location,
-            #add here the constant attributes?
         )
 
     def generate_single_load_profile(
@@ -1025,14 +1280,30 @@ appliances: no appliances assigned to the user.
 
         for (
             App
-        ) in self.App_list:  # iterates for all the App types in the given User class
-            App.generate_load_profile(
-                prof_i, peak_time_range, day_type, power=App.power[prof_i]
-            )
-
+        ) in self.App_list:  #iterates for all the App types in the given User class
+            if type(App) is Appliance: #check to which class the App belongs to. This distinction is made because Appliance and Electric_Vehicle takes different arguments.
+                App.generate_load_profile(
+                    prof_i, peak_time_range, day_type, power=App.power[prof_i]
+                )
+            else:
+                #convert days back to actual date 'dd/mm/yyyy' for weekday/weekend distinction
+                day_type = self.usecase.days[prof_i]
+                #initialise the mobility attributes
+                App.add_mobility_attribute_values()
+                #start of updating the daily_use
+                App.generate_load_profile(
+                    prof_i, peak_time_range, day_type, self.current_user_index,
+                )
+                #used to store temporary the index of 'for _ in range(self.num_users) without passing it as an argument for this function
+                #App.EV_users App.EV_users is a dictionary which stores the ID of the user and the daily profiles: {user_num:daily profiles of array 1440 for x amount of days}
+                #to be used for concatinating into a total profile for each user. From this, the parking indexes are calculated.
+                #result {0:App.daily_use,1:App.daily_use,2:App.daily_use.. etc} with the count for num_user for that day
+                App.EV_users[self.current_user_index].append(App.daily_use)
+   
             single_load = (
-                single_load + App.daily_use
-            )  # adds the Appliance load profile to the single User load profile
+                    single_load + App.daily_use
+            )  # adds the Appliance load profile to the single User load profile  
+            
         return single_load
 
     def generate_aggregated_load_profile(
@@ -1062,15 +1333,120 @@ appliances: no appliances assigned to the user.
         """
 
         self.load = np.zeros(1440)  # initialise empty load for User instance
-        for _ in range(self.num_users):
+        for i in range(self.num_users): 
+            self.current_user_index = i #workaround for tracking the loop by setting i as an attribute for temporary index save without passing it as an argument
             # iterates for every single user within a User class.
             self.load = self.load + self.generate_single_load_profile(
-                prof_i, peak_time_range, day_type
+                prof_i, peak_time_range, day_type,
             )
 
         return self.load
+    
+    def generate_single_charging_profile(self, 
+                                         SOC_max, 
+                                         SOC_min, 
+                                         SOC_min_rand, 
+                                         SOC_initial, 
+                                         infr_pr, 
+                                         ch_prob, 
+                                         country, 
+                                         minutes, 
+                                         eff, 
+                                         charging_location_preference,
+                                         Ch_stations,
+                                         charging_mode,
+                                         n_periods,
+                                         user_num,
+                                         LOCATION_MAP
+                                         ):
+        
+        single_user_load = np.zeros(n_periods)
+        single_user_locational_load = {location: np.zeros(n_periods, dtype=np.float32) for location in LOCATION_MAP.keys()}
 
 
+        for (
+            App
+        ) in self.App_list:
+            if not isinstance(App, Electric_Vehicle):   #check if App is of type(EV), if true, than call App.method. Otherwise return that Appliance has no method charging profile
+                print(f'Appliance is not egible for generating charging profiles. This function is only available for objects of type Electric_Vehicle')
+                continue
+            else:
+                #App.concatenate_profiles(user_num) #Concatenates the daily_use profiles into a horizontal stacked array for num_users
+                EV_single_load, EV_locational_dict = App.charging_process(
+                            SOC_max,
+                            SOC_min,
+                            SOC_min_rand, 
+                            SOC_initial,
+                            infr_pr,
+                            ch_prob,
+                            country,
+                            minutes,
+                            eff,
+                            charging_location_preference,
+                            user_num,
+                            charging_mode,
+                            Ch_stations)
+                
+            single_user_load = single_user_load + EV_single_load
+            
+            for loc in single_user_locational_load:
+                single_user_locational_load[loc] += EV_locational_dict[loc]
+            
+        return single_user_load, single_user_locational_load
+
+    def generate_aggregated_charging_profile(
+        self, 
+        SOC_max, 
+        SOC_min, 
+        SOC_min_rand, 
+        SOC_initial, 
+        infr_pr, 
+        ch_prob, 
+        country, 
+        minutes, 
+        eff, 
+        Ch_stations, 
+        charging_mode, 
+        n_periods,
+        LOCATION_MAP
+    ):
+        app_list_user_ev = [app for app in self.App_list if isinstance(app, Electric_Vehicle)]
+        
+        for App in app_list_user_ev:
+            charging_location_preference = App.adjust_charging_preferences(App.location_preference_factor)
+            
+
+        total_user_load = np.zeros(n_periods)  #initialise empty charging list for user
+        aggregated_user_locational_load = { loc: np.zeros(n_periods)for loc in LOCATION_MAP.keys()}
+        
+        for user_num in range(self.num_users):
+            # iterates for every single user within a User class.
+            
+            single_user_load, single_user_locational_load = self.generate_single_charging_profile(SOC_max, 
+                                                                          SOC_min, 
+                                                                          SOC_min_rand, 
+                                                                          SOC_initial, 
+                                                                          infr_pr, 
+                                                                          ch_prob, 
+                                                                          country, 
+                                                                          minutes, 
+                                                                          eff, 
+                                                                          charging_location_preference, 
+                                                                          Ch_stations, 
+                                                                          charging_mode, 
+                                                                          n_periods, 
+                                                                          user_num,
+                                                                          LOCATION_MAP
+                                                                         )
+            
+            total_user_load += single_user_load
+
+            for loc in aggregated_user_locational_load:
+                aggregated_user_locational_load[loc] += single_user_locational_load[loc]
+        
+        return total_user_load, aggregated_user_locational_load
+    
+    
 class Appliance:
     def __init__(
         self,
@@ -1090,13 +1466,7 @@ class Appliance:
         pref_index: int = 0,
         wd_we_type: int = 2,
         name: str = "",
-        distance_total: float = 0.0,
-        randomised_distance: float = 0.3,
-        randomised_velocity: float = 0.3,
-        distance_minimal: float = 0,
-        power_parameters: list = [0.35, -15.2, 620],
-        battery_capacity: int = 100,
-        location: str = "",
+        
     ):
         """Creates an appliance for a given user
 
@@ -1160,11 +1530,12 @@ class Appliance:
             1. if power is not passed as a number of series.
             2. power array size is not (366,1)
         """
-
+        
         self.user = user
         self.name = name
         self.number = number
         self.num_windows = num_windows
+        
 
         if func_time == 0:
             warnings.warn(
@@ -1184,13 +1555,6 @@ class Appliance:
         self.thermal_p_var = thermal_p_var
         self.pref_index = pref_index
         self.wd_we_type = wd_we_type
-        self.distance_total = distance_total
-        self.randomised_distance = randomised_distance
-        self.randomised_velocity = randomised_velocity
-        self.distance_minimal = distance_minimal,
-        self.power_parameters = power_parameters
-        self.battery_capacity = battery_capacity
-        self.location = location
 
         self.__constant_power = False
 
@@ -1329,7 +1693,7 @@ class Appliance:
     def __repr__(self):
         try:
             return self.save()[
-                ["user_name", "num_users", "name", "number", "power"]
+                ["user_name", "num_users", "name", "number", "power", ]
             ].to_string()
         except Exception:
             return ""
@@ -1537,6 +1901,7 @@ class Appliance:
         """
         # identify which of the unallocated time ranges contain the switch-on event
         spot_idx = None
+        
         for i, fs in enumerate(self.free_spots):
             if indexes[0] >= fs.start and indexes[-1] <= fs.stop:
                 spot_idx = i
@@ -1563,6 +1928,7 @@ class Appliance:
 
                 self.free_spots.insert(spot_idx, new_spot2)
                 self.free_spots.insert(spot_idx, new_spot1)
+                
 
     def update_daily_use(self, coincidence, power, indexes):
         """Update the daily use depending on existence of duty cycles of the Appliance instance
@@ -1593,6 +1959,7 @@ class Appliance:
 
         else:  # if no duty cycles are specified, a regular switch_on event is modelled
             # randomises also the App Power if thermal_p_var is on
+            
             np.put(
                 self.daily_use,
                 indexes,
@@ -2010,7 +2377,7 @@ class Appliance:
         """
         # initialises variables for the cycle
         self.daily_use = np.zeros(1440)
-
+        
         # skip this appliance in any of the following applies
         if (
             random.uniform(0, 1) > self.occasional_use
@@ -2028,6 +2395,7 @@ class Appliance:
         rand_window_2 = self.calc_rand_window(window_idx=2)
         rand_window_3 = self.calc_rand_window(window_idx=3)
         rand_windows = [rand_window_1, rand_window_2, rand_window_3]
+        
 
         # random variability is applied to the total functioning time and to the duration
         # of the duty cycles provided they have been specified
@@ -2073,7 +2441,8 @@ class Appliance:
             )
             if indexes is None:
                 break  # exit cycle and go to next Appliance as there are no available windows anymore
-
+            
+            
             # the count of total time is updated with the size of the indexes array
             tot_time = tot_time + indexes.size
 
@@ -2102,3 +2471,1360 @@ class Appliance:
                 coincidence = self.calc_coincident_switch_on(inside_peak_window)
                 # Update the daily use depending on existence of duty cycles of the Appliance instance
                 self.update_daily_use(coincidence, power=power, indexes=indexes)
+
+class Electric_Vehicle(Appliance):
+    def __init__(
+            self, 
+            user,
+            number: int = 1, 
+            power: Union[float, pd.DataFrame] = 0,          #no init
+            num_windows: int = 3,                           #no init
+            func_time: int = 0,                             #no init
+            time_fraction_random_variability: float = 0,    #mandatory 0, otherwise double randomized time of use.
+            func_cycle: int = 1,                            #no init
+            fixed: str = "no",              
+            fixed_cycle: int = 0, 
+            continuous_duty_cycle: int = 0, 
+            occasional_use: float = 1,                      #no init
+            flat: str = "no",                       
+            thermal_p_var: int = 0, 
+            pref_index: int = 0, 
+            wd_we_type: int = 3,                            #always 3
+            name: str = "",
+            car_type: str = None,                           #mandatory
+            user_type: str = None,                          #mandatory
+            distance_random_variability: float = None,
+            velocity_random_variability: float = None,
+            power_random_variability: float = None,
+            random_var_w: float = None,
+            power_parameters: List = [],
+            battery_capacity: int = None,
+            electric_vehicle: bool = True,
+            location_preference_factor: float = 1,
+            minimum_waiting_time: int = 60,
+            charging_strategy = None,
+            random_seed: int = None
+        ):
+        super().__init__(
+            user, 
+            number,
+            power,                                          
+            num_windows, 
+            func_time, 
+            time_fraction_random_variability, 
+            func_cycle, 
+            fixed, 
+            fixed_cycle, 
+            continuous_duty_cycle, 
+            occasional_use, 
+            flat, 
+            thermal_p_var, 
+            pref_index, 
+            wd_we_type, 
+            name
+        )  
+        
+    #      FORBIDDEN = {"power", "num_windows", ...}
+
+    # def __init__(self, **kwargs):
+    #     for k in list(kwargs):
+    #         if k in self.FORBIDDEN and kwargs[k] is not None:
+    #             raise ValueError(f"{k} cannot be set for an Electric Vehicle.")
+       
+        #mandatory input
+        self.random_seed = random_seed
+        if self.random_seed:
+            random.seed(self.random_seed)
+        self.car_type = car_type
+        self.user_type = user_type
+        self.electric_vehicle = electric_vehicle
+        self.location_preference_factor = location_preference_factor
+
+        #If these attributes are not given by the user, then take the standard values from Utils_mobility.
+        self.distance_random_variability = distance_random_variability
+        if self.distance_random_variability is None:
+            self.distance_random_variability = 0.3
+
+        self.velocity_random_variability = velocity_random_variability
+        if self.velocity_random_variability is None:
+            self.velocity_random_variability = 0.3
+
+        self.power_random_variability = power_random_variability
+        if self.power_random_variability is None:
+            self.power_random_variability = 0.1
+        
+        if self.time_fraction_random_variability != 0:
+            warnings.warn('Time_fraction_random_variability is not available for EV simulation. Time is randomised by distance instead. Value is set to 0')
+            self.time_fraction_random_variability = 0
+        
+        if self.fixed_cycle != 0:
+            self.fixed_cycle == 0
+        
+        self.power_parameters = power_parameters
+        self.battery_capacity = battery_capacity
+        
+        #attributes set by mobility module
+        self.distance_recovery = 0
+        self.__distance_total = None
+        self.windows_save = defaultdict(dict)
+        self.EV_users = defaultdict(list) 
+        self.daily_travel_intervals = defaultdict(dict)
+        self.minimum_waiting_time = minimum_waiting_time
+
+        #stores the single days as a list, so EV_user[1] is a list with [[self.daily_use],[self.daily_use]]. EV_user[1][0] returns daily use of num 1, the first day
+       
+        #stores the total sequence of days          
+        self.EV_usage_total_days = {}   
+        self.daily_windows_dict = None
+        self.travel_counts_by_day = defaultdict(list)
+
+        #attributes set by charging module
+        self._charging_strategy = charging_strategy
+
+        #metric save
+        self.length_of_charging_sessions = np.array([])
+        self.locations_total = {}
+        self.charging_distribution = []
+        self.average_travel_time = [] #save of func_time
+        self.average_distance_data = [] #save of distance_total
+        self.locational_charging_mask = []
+        self.save_charging_power = []
+        self.kwh_per_charging_session = []
+
+        #attributes initialized by windows method
+        self.random_var_w = random_var_w
+        self.window_1 = np.array([0, 0])
+        self.window_2 = np.array([0, 0])
+        self.window_3 = np.array([0, 0])
+        self.random_var_1 = 0
+        self.random_var_2 = 0
+        self.random_var_3 = 0
+        self.daily_use = np.zeros(1440)
+        self.free_spots = None
+        self.occasional_use = occasional_use
+
+         # attribute used for cycle_behaviour
+        self.cw11 = np.array([0, 0])
+        self.cw12 = np.array([0, 0])
+        self.cw21 = np.array([0, 0])
+        self.cw22 = np.array([0, 0])
+        self.cw31 = np.array([0, 0])
+        self.cw32 = np.array([0, 0])
+
+        self.random_cycle1 = np.array([])
+        self.random_cycle2 = np.array([])
+        self.random_cycle3 = np.array([])
+
+        # attribute used to know if a switch on event falls within a given duty cycle window
+        # if it is 0, then no switch on events happen within any duty cycle windows
+        self.current_duty_cycle_id = 0
+    
+    @property
+    def country(self):
+        return self.user.usecase._country
+    
+    @property
+    def year(self):
+        return self.user.usecase._year
+    
+    @property
+    def mob(self):
+        return self.user.usecase.mobility
+    
+    
+    def add_mobility_attribute_values(self):
+        self.t_func = self.mob.get_t_func()
+        self.d_tot = self.mob.get_d_tot()
+        self.d_min = self.mob.get_d_min()
+        self.window = self.mob.get_windows()
+        
+        self.location_dict = self.mob.get_location_dict()
+        self.perc_usage = self.mob.get_perc_usage()
+        self.charging_days = self.user.usecase.days
+        
+        self.day_start_location = random.choices(list(self.location_dict[0].keys()), list(self.location_dict[0].values()))[0]
+       
+    
+    def set_daily_randomised_attributes(self, day_type, window_type): 
+        # gets the type of day -> weekday, saturday, sunday
+        type_of_day = self.mob.calendar.get_day_type_mobility(day_type)
+        if window_type == 'free time':
+            self.distance_recovery = 0
+        self.__distance_total = self.d_tot[type_of_day]*self.perc_usage[type_of_day][self.user_type][window_type] + self.distance_recovery
+        
+        if self.user_type == 'working':
+            self.func_cycle = int(round(self.t_func[type_of_day][window_type]))
+        elif self.user_type == 'student' and window_type == 'main':
+            self.func_cycle = int(round(self.t_func[type_of_day]['mean']))
+        elif self.user_type == 'student' and window_type == 'free time':
+            self.func_cycle = int(round(self.t_func[type_of_day]['free time']))
+        else:
+            self.func_cycle = int(round(self.t_func[type_of_day]['free time']))
+        
+        if self.user_type == 'working':
+            distance_minimum = self.d_min[type_of_day][window_type]
+        elif self.user_type == 'student' and window_type == 'main':
+            distance_minimum = self.d_min[type_of_day]['mean']
+        elif self.user_type == 'student' and window_type == 'free time':
+            distance_minimum = self.d_min[type_of_day]['free time']
+        else:
+            distance_minimum = self.d_min[type_of_day]['free time']
+        
+
+        #d_tot*random_var_d
+        random_var_d = random_variation(var=self.distance_random_variability)       
+        randomised_distance = round(random.uniform(self.__distance_total,
+                                               int(self.__distance_total*random_var_d)
+                                               )) 
+       
+        #average velocity of the trip, minimum value is 20 km/h to get reasonable values from the power curve
+        calculated_velocity = distance_minimum/self.func_cycle * 60             
+        random_var_v = random_variation(var=self.velocity_random_variability)
+        randomised_velocity = np.maximum(20, round(random.uniform(calculated_velocity,
+                                                                  int(calculated_velocity*random_var_v))
+                                                                  )) 
+        
+        #calculate the power as function of the velocity and the power parameters
+        power = (self.power_parameters[0] * randomised_velocity**2 + 
+                 self.power_parameters[1] * randomised_velocity + 
+                 self.power_parameters[2]) * 12
+        power_not_corrected = random_variation(var=self.power_random_variability, norm=power) * np.ones(1440)
+        self.power = self.temperature_correction(day_type) * power_not_corrected
+        
+        #calculate how much time is the EV is active on day idx of usecase.days
+        self.func_time = int(round(randomised_distance/randomised_velocity * 60))
+        self.average_travel_time.append(self.func_time)
+        
+        if window_type == 'main':
+            self.occasional_use = self.mob.occasional_use['main'][type_of_day]
+        else:
+            self.occasional_use = self.mob.occasional_use['free time'][type_of_day]
+        
+        self.window_1 = np.array([0,0])
+        self.window_2 = np.array([0,0])
+        self.window_3 = np.array([0,0])
+      
+        for i, value in enumerate(self.daily_windows_dict[window_type], start=1):
+            setattr(self,f"window_{i}",value)
+        
+
+
+    def set_windows(self, prof_i,day_type, user_index):
+        # resets the windows to 0. This is necessary because every num_user of a User uses the same EV-appliance.
+        self.window_1 = np.array([0,0])
+        self.window_2 = np.array([0,0])
+        self.window_3 = np.array([0,0])
+        
+        # gets the type of day -> weekday, saturday, sunday
+        type_of_day = self.mob.calendar.get_day_type_mobility(day_type) 
+        daily_windows_dict ={}
+        new_values_main = []
+        
+        if type_of_day == 'weekday':
+            window_user = self.window[self.user_type]
+            standard_windows = window_user['main']   
+        else:
+            window_user = self.window['inactive']
+            standard_windows = window_user['main']
+            
+        for i, value in enumerate(standard_windows, start=1):
+            setattr(self,f"window_{i}",value)
+
+        # apply the windows function for only the 'main' windows. The 'free time' windows are derived from the gaps of the main windows.
+        self.windows(window_1 = self.window_1, window_2 = self.window_2, window_3 = self.window_3) 
+        new_values_main.append(self.calc_rand_window(window_idx=1))
+        new_values_main.append(self.calc_rand_window(window_idx=2))
+         
+        daily_windows_dict['main'] = np.array(new_values_main, dtype=np.int64)
+        
+        start, end = np.int64(0), np.int64(1440)
+        main_windows = daily_windows_dict['main']
+
+        # initialize free time list
+        new_values_free_time = []
+
+        #add free time before the first main window
+        if main_windows[0][0] > start:
+            new_values_free_time.append([start, main_windows[0][0]-1])
+
+        # add free time windows as the residual the time between main windows
+        if len(window_user['free time']) == 3:
+            for i in range(len(main_windows)-1):
+                end_current = main_windows[i][1]
+                start_next = main_windows[i+1][0]
+                if start_next > end_current:
+                    new_values_free_time.append([end_current+1, start_next-1])
+
+            if main_windows[-1][1] < end:
+                new_values_free_time.append([main_windows[-1][1]+1, end])        
+        else:
+        #add free time after the last main window
+            if main_windows[0][1] < end:
+                new_values_free_time.append([main_windows[0][1]+1, end])
+
+        #update dictionary
+        daily_windows_dict['free time'] = np.array(new_values_free_time, dtype=np.int64)
+        
+        
+        self.windows_save[prof_i][user_index] = daily_windows_dict['main']
+        #print(f'self.windows_save for {self.name}: {self.windows_save}')
+       
+        # returns a dictionary in the format of {main: array([np.int64(X)],[np.int64(Y)]), main: ..., free time:..., free time:..., free time:...}
+        
+        
+        return daily_windows_dict
+        
+
+    def temperature_correction(self,day_type):
+        warnings.simplefilter('once', UserWarning)
+
+        #set the year to the most recent year of the temperature database if year > 2019. 
+        #this is a temporary fix because the temperature data supports only year 1980-2019.
+        if day_type.year > 2019:
+            day_type = day_type.replace(year=2019)
+
+        #convert to datetime.date for dictionary lookup
+        lookup_day = day_type.date()
+
+        #get the precomputed minute-resolution correction array
+        correction_array = self.mob.get_temperature()[lookup_day]
+
+        #return the correction array.
+        return correction_array
+            
+    def windows(
+        self,
+        window_1: Iterable = None,
+        window_2: Iterable = None,
+        random_var_w: float = None,
+        window_3: Iterable = None,
+    ):
+        """assings functioning windows to the appliance and adds the appliance to the user class
+
+        Parameters
+        ----------
+        window_1 : Iterable, optional
+            First functioning window, by default None
+
+        window_2 : Iterable, optional
+            Second functioning window, by default None
+
+        window_3 : Iterable, optional
+            Third functioning window, by default None
+
+        random_var_w : Percentage, optional
+            variability of the windows in percent, the same for all windows, by default 0
+
+        Raises
+        ------
+        InvalidWindow
+
+            * If number of specifies windows does not correspond to the given functioning windows.
+            * If the sum of all windows time intervals for the appliance is smaller than the time the appliance is supposed to be on.
+
+        Example
+        --------
+        If three time window is specified for the appliance as follow:
+
+        #. from 00:00:00 to 00:20:00
+        #. from 00:30:00 to 00:35:00
+        #. from 00:40:00 to 00:55:00
+
+        .. code-block:: python
+
+            user.windows(
+                window_1 = [0,20],
+                window_2 = [30,35],
+                window_3 = [40,55]
+            )
+        """
+        #update the windows when usecase is initialized?
+
+        if window_1 is None:
+            warnings.warn(
+                UserWarning(
+                    "No windows is declared, default window of 24 hours is selected"
+                )
+            )
+            self.window_1 = np.array([0, 1440])
+        else:
+            self.window_1 = window_1
+
+        if window_2 is None:
+            if self.num_windows >= 2:
+                raise InvalidWindow(
+                    "Windows 2 is not provided although 2 windows were declared"
+                )
+        else:
+            self.window_2 = window_2
+
+        if window_3 is None:
+            if self.num_windows == 3:
+                raise InvalidWindow(
+                    "Windows 3 is not provided although 3 windows were declared"
+                )
+        else:
+            self.window_3 = window_3
+
+        if self.random_var_w is None:
+            if random_var_w is None:
+                self.random_var_w = self.mob.random_var_w(self.user_type)
+                warnings.warn(
+                    UserWarning(
+                        f"No window variability is declared, default variability of {self.random_var_w}  is selected"))
+                
+            else:
+                self.random_var_w = random_var_w
+
+        # check that the time allocated by the windows is larger or equal to the func_time of the appliance
+        window_time = 0
+        for i in range(1, self.num_windows + 1, 1):
+            window_time = window_time + np.diff(getattr(self, f"window_{i}"))[0]
+        if window_time < self.func_time:
+            raise InvalidWindow(
+                f"The sum of all windows time intervals for the appliance '{self.name}' of user '{self.user.user_name}' is smaller than the time the appliance is supposed to be on ({window_time} < {self.func_time}). Please check your input file for typos."
+            )
+
+        self.random_var_1 = int(
+            self.random_var_w * np.diff(self.window_1)[0]
+        )  
+       # calculate the random variability of window1, i.e. the maximum range of time they can be enlarged or shortened
+        self.random_var_2 = int(
+            self.random_var_w * np.diff(self.window_2)[0]
+        )  # same as above
+        
+        self.random_var_3 = int(
+            self.random_var_w * np.diff(self.window_3)[0]
+        )  
+        # same as above
+
+        # automatically appends the appliance to the user's appliance list
+        self.user._add_appliance_instance(self) #redudant if it is done beforehand
+
+        if self.fixed_cycle == 1:
+            self.cw11 = self.window_1
+            self.cw12 = self.window_2
+
+    def update_available_time_for_switch_on_events(self, indexes):
+        """Remove the given time indexes from the ranges available to switch appliance on
+
+        Parameters
+        ----------
+        indexes: list of int
+            time indexes of the daily profile concerned by a new switch-on event
+
+        Return
+        ------
+        nothing but can modify self.free_spots
+        """
+        # identify which of the unallocated time ranges contain the switch-on event
+        
+        spot_idx = None
+        
+        for i, fs in enumerate(self.free_spots):
+            #print(f'free spots number {i} with the spots of {fs}')
+            if indexes[0] >= fs.start and indexes[-1] <= fs.stop:
+                spot_idx = i
+                break
+        if spot_idx is not None:
+            spot_to_split = self.free_spots.pop(spot_idx)
+
+            # adjust the free spots for the about to be removed indexes
+            # it already moves the whole time frame, but it inserts back the residual of the time frame without the 'used' indexes
+            if indexes[0] == spot_to_split.start and indexes[-1] == spot_to_split.stop:
+                pass  # nothing to do as the whole range should be removed, which is already the case from line above
+            elif indexes[0] == spot_to_split.start:
+                # reinsert a range going from end of indexes up to the end of picked range
+                self.free_spots.insert(
+                    spot_idx, slice(indexes[-1] + self.minimum_waiting_time, spot_to_split.stop, None) 
+                )
+            elif indexes[-1] == spot_to_split.stop:
+                # reinsert a range going from beginning of picked range up to the beginning of indexes
+                self.free_spots.insert(
+                    spot_idx, slice(spot_to_split.start, indexes[0], None)
+                )
+            else:
+                # split the range into 2 smaller ranges
+                new_spot1 = slice(spot_to_split.start, indexes[0], None)
+                new_spot2 = slice(indexes[-1] + self.minimum_waiting_time, spot_to_split.stop, None) 
+                #print(f"start {indexes[0]}, stop {indexes[-1]} total {indexes[-1]+self.minimum_waiting_time}")
+                self.free_spots.insert(spot_idx, new_spot2)
+                self.free_spots.insert(spot_idx, new_spot1)
+                #print(f'free spots after inserting {self.free_spots}')
+    
+    def update_daily_use(self, coincidence, power, indexes):
+        """Update the daily use depending on existence of duty cycles of the Appliance instance
+
+        This corresponds to step 2d. and 2e. of [1]
+
+        [1] F. Lombardi, S. Balderrama, S. Quoilin, E. Colombo,
+            Generating high-resolution multi-energy load profiles for remote areas with an open-source stochastic model,
+            Energy, 2019, https://doi.org/10.1016/j.energy.2019.04.097.
+
+        """
+        
+        if (
+            self.fixed_cycle > 0
+        ):  # evaluates if the app has some duty cycles to be considered
+            # the proper duty cycle was selected in self.rand_switch_on_window()
+            # now setting the corresponding power values in the indexes range
+            if self.current_duty_cycle_id == 1:
+                np.put(self.daily_use, indexes, (self.random_cycle1 * coincidence))
+            elif self.current_duty_cycle_id == 2:
+                np.put(self.daily_use, indexes, (self.random_cycle2 * coincidence))
+            elif self.current_duty_cycle_id == 3:
+                np.put(self.daily_use, indexes, (self.random_cycle3 * coincidence))
+            else:
+                print(
+                    f"The app {self.name} has duty cycle option on, however the switch on event fell outside the provided duty cycle windows"
+                )
+
+        else:  # if no duty cycles are specified, a regular switch_on event is modelled
+            #print(f'indexes list for which minutes it is active{indexes} with a length of {len(indexes)} in comparison with func_cycle {self.func_cycle} and func time of {self.func_time}')
+            np.put(
+                self.daily_use,
+                indexes,
+                #slice of self.power array for indexes.
+                (power[indexes[0]:indexes[-1]+1]*coincidence)
+            )
+            
+        # updates the time ranges remaining for switch on events, excluding the current switch_on event
+        self.update_available_time_for_switch_on_events(indexes)
+         
+
+    def generate_load_profile(self, prof_i, peak_time_range, day_type, user_index):
+        
+        #day_type is here the date e.g. 2025-06-27 00:00:00
+        self.daily_windows_dict = self.set_windows(prof_i = prof_i,day_type = day_type, user_index=user_index) #set the windows for that day based on data
+        
+        # initialises variables for the cycle
+        self.daily_use = np.zeros(1440)
+        #prof_i is index from 0.. X (1,2,3,.. etc) for len(usecase.days)
+    
+        for window_type in ['free time', 'main']: #get the correct windows for the window_type, this can be done in set_daily_randomised_attributes by getting. Set the window that is not getting used to 0.
+            #set the randomized attributes for that day
+            self.set_daily_randomised_attributes(day_type, window_type) 
+            
+            # skip this vehicle if the following applies
+            if (# skip if the occasional use is lower than the treshold
+                random.uniform(0, 1) > self.occasional_use 
+                # skip if the app has a func_time of 0
+                or self.func_time == 0
+            ):
+                
+                self.distance_recovery += self.__distance_total
+                continue 
+
+            self.distance_recovery = 0
+            self.average_distance_data.append(self.__distance_total)
+            #print(self.__distance_total)
+            
+            #print(f' average distance {self.average_distance_data}')
+            rand_windows = [self.window_1,self.window_2,self.window_3] #always 3, defined set_windows
+           
+            # random variability is applied to the total functioning time and to the duration
+            # of the duty cycles provided they have been specified
+            # step 2a of [1]
+            rand_time = self.rand_total_time_of_use(
+                self.window_1,self.window_2,self.window_3
+            )
+            
+            # redefines functioning windows based on the previous randomisation of the boundaries
+            # step 2b of [1]
+            if self.flat == "yes":
+                # for "flat" appliances the algorithm stops right after filling the newly
+                # created windows without applying any further stochasticity
+                total_power_value = self.power * self.number #take the power for that day and just multiplies it.
+                
+                for rand_window in rand_windows:
+                    self.daily_use[rand_window[0] : rand_window[1]] = np.full(
+                        np.diff(rand_window), total_power_value[rand_window[0] : rand_window[1]]
+                    )
+                # single_load = single_load + self.daily_use
+                return
+            else:
+                # "non-flat" appliances a mask is applied on the newly defined windows and
+                # the algorithm goes further on
+                for rand_window in rand_windows:
+                    self.daily_use[rand_window[0] : rand_window[1]] = np.full(
+                        np.diff(rand_window), 0.001
+                    )
+
+            # calculates randomised cycles taking the random variability in the duty cycle duration
+            self.assign_random_cycles()
+
+            # steps 2c-2e repeated until the sum of the durations of all the switch-on events equals rand_time
+
+            self.free_spots = [
+                slice(rw[0], rw[1], None) for rw in rand_windows if rw[0] != rw[1]
+            ]
+
+            tot_time = 0
+            while tot_time <= rand_time and rand_time != 0:
+                # one option could be to generate a lot of them at once
+                indexes = self.rand_switch_on_window(
+                    rand_time=rand_time,  # TODO maybe only consider rand_time-tot_time ...
+                )
+                
+                if indexes is None:
+                    break  # exit cycle and go to next Appliance as there are no available windows anymore
+
+                # the count of total time is updated with the size of the indexes array
+                tot_time = tot_time + indexes.size
+                
+                if tot_time > rand_time:
+                    # the total functioning time is reached, a correction is applied to avoid overflow of indexes
+                    indexes_adj = indexes[: -(tot_time - rand_time)]
+                    
+                    if len(indexes_adj) > 0:
+                        inside_peak_window = within_peak_time_window(
+                            indexes_adj[0],
+                            indexes_adj[-1],
+                            peak_time_range[0],
+                            peak_time_range[-1],
+                        )
+
+                        # Computes how many of the 'n' of the Appliance instance are switched on simultaneously
+                        coincidence = self.calc_coincident_switch_on(inside_peak_window)
+                        # Update the daily use depending on existence of duty cycles of the Appliance instance
+                        self.update_daily_use(coincidence, power=self.power, indexes=indexes_adj)
+                    break  # exit cycle and go to next Appliance
+
+                else:
+                    inside_peak_window = within_peak_time_window(
+                        indexes[0], indexes[-1], peak_time_range[0], peak_time_range[-1]
+                    )
+
+                    coincidence = self.calc_coincident_switch_on(inside_peak_window)
+                    # Update the daily use depending on existence of duty cycles of the Appliance instance
+                    self.update_daily_use(coincidence, power=self.power, indexes=indexes)
+    
+    def next_location(self, 
+                     park_end, 
+                     current_location, 
+                     user_num, 
+                     ):
+        #logic for rescaling location to weekend locations
+
+
+        day_number = (park_end // 1440)
+
+        match self.user_type:
+            case 'working' | 'student':
+                main_minutes_intervals = self.windows_save[day_number][user_num]
+                main_minutes = [i for start, end in main_minutes_intervals for i in range(start, end + 1)] #dependent on day, user_num and then two main windows
+                exclude_locations = {'Leisure','Errands'}
+            case 'inactive':
+                main_minutes_intervals = self.windows_save[day_number][user_num]
+                main_minutes = [i for start, end in main_minutes_intervals for i in range(start, end + 1)]
+                exclude_locations = {'Work/Study'}
+        
+        index_day_residual = park_end - (day_number * 1440)
+        main_window_location_correction = {loc: val for loc, val in self.location_dict[index_day_residual].items() if not (index_day_residual in main_minutes and loc in exclude_locations)}
+        
+        #e.g. the last trip of inactive should be home, otherwise the chance that it does not land on home is way to big.
+        #this stems from the random_activation which leads ohterwise to unrealistic equilibria (e.g. two trips in the first main window -> W-W trip is very common -> exhausted 
+        #       the amount of travelled total minutes -> last stay becomes work.)
+        daily_trips = self.daily_travel_intervals[user_num][day_number]
+        
+        if not daily_trips:
+            return current_location
+
+        is_last_parking_of_day = (
+            (park_end + 1 - 1440 * day_number) == daily_trips[-1][0]
+        )
+
+        if is_last_parking_of_day:
+            return 'Home'
+        
+        #check what the day_number is, get that for user_num and the correct day. only need main windows actually.
+        #location_dict_option ={loc: prob for loc, prob in main_window_location_correction[index_day_residual].items() if loc != current_location}
+        location_dict_option ={loc: prob for loc, prob in main_window_location_correction.items() if loc != current_location}
+        locations = [location for location in location_dict_option.keys()]
+        weights = [value for value in location_dict_option.values()] #automatically normalized thus input is valid
+        location = random.choices(locations, weights)
+        return location[0]
+            
+    def get_parking_indexes(self, daily_profile):
+        #save the sorted indexes into (m x n) array with m being the amount of days and n the minutes (=1440), so each day has the completed travel log.
+        #after that, with this function we can get the (m x n) parking indexes 
+        mask = daily_profile != 0
+
+        #find where mask changes (start or end of a travel period)
+        changes = np.diff(mask.astype(int))
+        starts = np.where(changes == 1)[0] 
+        ends = np.where(changes == -1)[0]
+
+        #define the starts at index 0 or the end at last index
+        if mask[0]:
+            starts = np.r_[0, starts]
+        if mask[-1]:
+            ends = np.r_[ends, len(daily_profile)]
+
+        #combine into a tuple interval
+        travel_intervals = list(zip(starts, ends)) 
+
+        #create the parking indexes by deleting the travel intervals.
+        park_indexes = np.arange(len(daily_profile)) #this must be replaced by 
+        mask = np.ones_like(park_indexes, dtype=bool)  #create a mask of True values
+
+        for start, end in travel_intervals:
+            mask[start:end+1] = False  #set interval to False and removes those values
+
+        #apply the mask to remove the intervals that indicate a travel event. Remaining intervals of the original array indicate parking events.
+        park_indexes = np.split(park_indexes[mask], np.where(np.diff(park_indexes[mask]) > 1)[0]+1)
+        
+        park_indexes_intervals = [(park_indexes[i][0], park_indexes[i][-1]) for i in range(len(park_indexes))]
+        
+        return travel_intervals, park_indexes_intervals
+    
+    def merge_consecutive_intervals(self, intervals): 
+        # merges consecutive intervals into one travel/parking event for trip consistency. 
+        # e.g. travel 1:(np.int64(568), np.int64(620)), travel 2: (np.int64(621), np.int64(635)) -> [(np.int64(568),np.int64(635))]
+        if not intervals:
+            return []
+
+        intervals.sort(key=lambda x: x[0])
+        merged = [intervals[0]]
+
+        for current in intervals[1:]:
+            last = merged[-1]
+            # check if current interval starts immediately after or overlaps with the last
+            if current[0] <= last[1] + 1:
+                # merge by extending the end of the last interval
+                new_start = np.int64(last[0])
+                new_end = np.int64(max(last[1], current[1]))
+                merged[-1] = (new_start, new_end)
+            else:
+                merged.append((np.int64(current[0]), np.int64(current[1])))
+
+        return merged  
+        
+    def update_location(self, user_num, travel_intervals, park_index):
+        locations_parking = {}
+        location_series = [] 
+        location = self.day_start_location
+
+        #get the minimum value of both lengths. This is to adress edge cases where EV's start or end with travelling, 
+        #creating an equal amount tuples
+        for i in range(min(len(park_index), len(travel_intervals))):
+
+            park_start, park_end = park_index[i]
+            travel_start, travel_end = travel_intervals[i]
+
+            location_series.append((park_start, park_end, location))
+
+            location = self.next_location(park_end, location, user_num)
+
+            location_series.append((travel_start, travel_end, "traveling"))
+
+        #add last parking interval if park_indexes_intervals = travel_intervals + 1
+        if len(park_index) > len(travel_intervals):
+
+            park_start, park_end = park_index[-1]
+            location_series.append((park_start, park_end, location))
+        
+        location_series.sort(key=lambda x: x[0])
+        fixed = []
+
+        for start, end, loc in location_series:
+
+            if not fixed:
+                fixed.append([start, end, loc])
+                continue
+
+            prev_start, prev_end, prev_loc = fixed[-1]
+
+            #
+            if start > prev_end + 1:
+                fixed.append([prev_end + 1, start - 1, prev_loc])
+
+            fixed.append([start, end, loc])
+
+        location_series = [(s, e, l) for s, e, l in fixed]
+
+        time_end = len(self.user.usecase.days) * 1440 - 1
+
+        if location_series:
+
+            last_start, last_end, last_loc = location_series[-1]
+
+            if last_end < time_end:
+                location_series.append(
+                    (last_end + 1, time_end, last_loc)
+                )
+        
+        #reset the start_location for the next users that iterates over the EV object
+        self.day_start_location = random.choices(list(self.location_dict[0].keys()), list(self.location_dict[0].values()))[0]
+        
+        # store the locations in a list 
+        self.locations_total[user_num] = location_series
+        # store only the parking locations for faster look up in the charging process
+        locations_parking = [(start, end, loc) for start, end, loc in self.locations_total[user_num] if loc != "traveling"]
+        #reset starting location for the next user that uses this appliance
+        self.day_start_location = random.choices(list(self.location_dict[0].keys()), list(self.location_dict[0].values()))[0]
+
+        return locations_parking
+         
+    def adjust_charging_preferences(self, location_preference_factor,
+                                    ):
+        #TODO make this dynamic so that the dictionary gets created with the locations and user types. base_preference_locations.setdefault(loction_key, 1)
+        base_preferences_locations = {
+        'working': {'Home': 1, 'Work/Study':1, 'Leisure':1, 'Errands':1},
+        'student': {'Home': 1, 'Work/Study':1, 'Leisure':1, 'Errands':1},
+        'inactive':{'Home': 1, 'Work/Study':1, 'Leisure':1, 'Errands':1}
+        }
+
+        user_type_preferences = {
+        'working': ['Home','Work/Study'],
+        'student': ['Work/Study', 'Errands', 'Leisure'],
+        'inactive': ['Home','Errands', 'Leisure']
+        }
+
+        if self.user_type not in base_preferences_locations:
+            raise ValueError(f"User type '{self.user_type}' not found in base preferences.")
+        if location_preference_factor < 1 or location_preference_factor > 3:
+            raise ValueError(f"location_prefecerence factor must be a value between 1 and 3")
+        
+    
+        base_prefs = base_preferences_locations[self.user_type]
+        preferred_locations = user_type_preferences.get(self.user_type, [])
+        
+        adjusted_prefs = {}
+        num_preferred = len(preferred_locations)
+        #num_other = total_locations - num_preferred if num_preferred < total_locations else 1  # Avoid division by zero
+
+        for location, value in base_prefs.items():
+            if location in preferred_locations:
+                adjusted_prefs[location] = value * location_preference_factor if num_preferred > 0 else value
+            else:
+                adjusted_prefs[location] = value
+        
+        original_total = sum(base_prefs.values())
+        adjusted_total = sum(adjusted_prefs.values())
+
+        normalization_factor = original_total / adjusted_total
+
+        normalized_prefs = {
+            loc: value * normalization_factor
+            for loc, value in adjusted_prefs.items()
+        }
+
+        return normalized_prefs
+
+    
+
+    def plan_day_ahead(self, SOC, parking_location_intervals, power_usage, Battery_capacity_kW, infr_pr, Ch_stations, location_mapping):
+        locational_load = {location: np.zeros(len(power_usage), dtype=np.float32) for location in location_mapping.keys()}
+        
+        for park in range(0,len(parking_location_intervals)):
+            if park == 0:
+                continue
+
+            park_start, park_end, location = parking_location_intervals[park]
+
+            SOC_park = SOC[park_start] #equal to SOC[park_ind[park][0]]
+
+            infr_probability = infr_pr[location][park_start]
+
+            #print(f'{user_num} {park_ind[park][1]} end and  {park_ind[park][0]} start: resulting in {t_park}')
+            if SOC_park >= self.SOC_max: #check if the maximum is already met and continue to the next park index if condition is satisfied
+                continue
+            
+            # look ahead for the expected consumption of energy over the course of a day (1440 minutes)
+            end_look_forward = (((parking_location_intervals[park][0]//1440)+1)*1440) - parking_location_intervals[park][0] 
+            end_index = min(parking_location_intervals[park][0]+end_look_forward, len(power_usage))
+            energy_next_travels = abs(np.sum(power_usage[parking_location_intervals[park][0]: end_index]))   #-> energy needed for all the travels that occur the next day [Watt]
+            
+            #energy needed as function of the SOC of the battery size
+            energy_next_travels_SOC = (energy_next_travels)/(Battery_capacity_kW) 
+            
+            #alpha calculation
+            alpha = self.charging_location_preference.get(location)
+            t_park = park_end - park_start
+            ch_prob = self.mob.charging_probability_extended(SOC_park, self.SOC_min, energy_next_travels_SOC, alpha, t_park)
+            
+            # try:  #Even if a charging spot is found, check if forced charging need to be used for the SOC_park < SOC_min constraint.
+            #     next_travel_ind_range = np.arange(park_end, parking_location_intervals[park+1][0]) #distance between the end of this park and start of the next park
+            #     len_next_park =  parking_location_intervals[park+1][1] - parking_location_intervals[park+1][0] #check how long next park session is
+            #     if len_next_park < 10: 
+            #         try:
+            #             next_travel_ind_range = np.arange(parking_location_intervals[park][1], parking_location_intervals[park+2][0])
+            #         except IndexError: 
+            #             pass
+            #     en_next_travel = abs(np.sum(power_usage[next_travel_ind_range]))#check how much energy is going to be used            
+            # except IndexError: # If there is an index error means we are in the last parking, special case. No need to asses the next energy travel because the simulation stops before that time.
+            #     en_next_travel = 0
+
+            #residual_energy = Battery_capacity_kW*SOC_park
+            
+            if (
+            (ch_prob >= random.random() and
+            infr_probability >= random.random()) or
+            (np.around(SOC_park, 2) <= self.SOC_min) 
+            #or (np.floor(residual_energy) <= np.ceil(en_next_travel/self.eff)))    
+            ): 
+                
+                if t_park == 0: #there are edge cases between free-time and main windows that generate t_park time of 1, resulting in a division error. Thus set to 1 to prevent the calculation error.
+                    t_park = 1 
+                
+                if Ch_stations == None:
+                    P_ch_nom = self.mob.infrastructure_probability(location, park_start)
+                else:
+                    P_ch_nom = random.choices(Ch_stations[0], weights=Ch_stations[1])[0]
+                        
+                en_charge_tot = (Battery_capacity_kW*(self.SOC_max - SOC_park))/self.eff
+                    
+                t_ch_nom = min(en_charge_tot / P_ch_nom, t_park)
+                t_ch_tot = int(- (en_charge_tot // -P_ch_nom)) # Fast way to perform the operation:   int(math.ceil(en_charge_tot/P_ch_nom)) 
+                t_ch = min(t_ch_tot, t_park) # charge until SOC max, if parking time allows                   
+                P_charge = P_ch_nom*t_ch_nom/t_ch #charging for an integer number of minutes at the power equivalent to the one that would charge en_charge_tot without rounding
+                charge_start = park_start
+                charge_end = charge_start + t_ch
+                power_usage[charge_start: charge_end+1] = P_charge #power_usage is evaluated in kW
+                locational_load[location][charge_start:charge_end] += P_charge  #with the slice of the indexes [charge_start: charge_end+1] from charging.
+
+            delta_soc = power_usage / Battery_capacity_kW 
+            SOC = delta_soc
+            SOC[0] = self.SOC_init
+            SOC = np.cumsum(SOC)
+
+                
+        charging_power = np.sum(np.stack(list(locational_load.values())),axis=0)
+        
+        is_charging = charging_power != 0
+
+        # Find where charging state changes
+        changes = np.diff(is_charging.astype(int))
+        starts = np.where(changes == 1)[0] + 1  # charging blocks start
+        ends = np.where(changes == -1)[0] + 1   # charging blocks end
+        charged_power = [power_usage[start:stop] for start, stop in zip(starts, ends)]
+        
+
+        # Handle edge cases: starts at 0 or ends at last index
+        if is_charging[0]:
+            starts = np.insert(starts, 0, 0)
+        if is_charging[-1]:
+            ends = np.append(ends, len(is_charging))
+
+        # length of the charging event
+        lengths = ends - starts
+        
+        lengths = lengths[lengths >= 30]
+        
+        # Average length
+        #aantal elements in the lengths = aantal laadbeurten. Delen door len(self.usecase.days)
+        charged_power_kwh = np.array([np.sum(sl) for sl in charged_power]) / 60 #kwh charged in the sessions.
+    
+        
+        self.kwh_per_charging_session.extend(charged_power_kwh)
+        self.length_of_charging_sessions = np.append(self.length_of_charging_sessions,lengths)
+        self.charging_distribution.append(charging_power)
+        self.save_charging_power.append(charging_power)     #array with the charging power
+
+        return charging_power, locational_load
+
+    def uncontrolled(self, SOC, parking_location_intervals, power_usage, Battery_capacity_kW, infr_pr, Ch_stations, location_mapping):
+        locational_load = {location: np.zeros(len(power_usage), dtype=np.float32) for location in location_mapping.keys()}
+        #[start,end,location] in order
+        for park in range(0, len(parking_location_intervals)):
+            if park == 0:
+                continue
+            
+            park_start, park_end, location = parking_location_intervals[park]
+
+            SOC_park = SOC[park_start] #equal to SOC[park_ind[park][0]]
+
+            infr_probability = infr_pr[location][park_start]
+        
+            if SOC_park >= self.SOC_max:
+                continue
+            else:
+                pass
+             
+            try:  # Energy used in the following travel
+                next_travel_ind_range = np.arange(parking_location_intervals[park][1], parking_location_intervals[park+1][0]) #distance between the end of this park and start of the next park
+                len_next_park =  parking_location_intervals[park+1][1] - parking_location_intervals[park+1][0] #check how long next park session is
+                if len_next_park < 10:
+                    try:
+                        next_travel_ind_range = np.arange(parking_location_intervals[park][1], parking_location_intervals[park+2][0])
+                    except IndexError:
+                        pass
+                en_next_travel = abs(np.sum(power_usage[next_travel_ind_range]))#check how much energy is going to be used            
+            except IndexError: # If there is an index error means we are in the last parking, special case -> dummy days needed
+                en_next_travel = 0
+                
+            residual_energy = Battery_capacity_kW*SOC_park  # Residual energy in the EV Battery
+            # Control to check if the user can charge based on infrastructure 
+            # availability, SOC, time of the day (Depending on the options activated)
+            if (
+                (self.ch_prob(SOC_park) > random.random() and  #self.charging_available_location(user_num,park_ind[park][0])
+                    infr_probability > random.random()
+                ) or 
+                (np.around(SOC_park, 2) <= self.SOC_min) 
+                or(np.floor(residual_energy) <= np.ceil(en_next_travel/self.eff))
+                ): 
+        
+                # Calculates the parking time
+                t_park = park_end - park_start                
+                if t_park == 0: #there are cases that RAMP produces a switch-on time of 1, resulting in a division error. Thus set to 1 to prevent the calculation error.
+                    t_park = 1
+                # Fills the array of plug in (1 = plugged, 0 = not plugged)
+                #plug_in[park_ind[park][0]:park_ind[park][1]] = 1
+                
+                if Ch_stations == None:
+                    P_ch_nom = self.mob.infrastructure_probability(location, park_start)
+                else:
+                    P_ch_nom = random.choices(Ch_stations[0], weights=Ch_stations[1])[0]
+                    
+                en_charge_tot = Battery_capacity_kW*(self.SOC_max - SOC_park)/self.eff
+                    
+                t_ch_nom = min(en_charge_tot / P_ch_nom, t_park) # charging time with nominal power (float)
+                t_ch_tot = int(- (en_charge_tot // -P_ch_nom)) # Fast way to perform the operation: int(math.ceil(en_charge_tot/P_ch_nom)) 
+                t_ch = min(t_ch_tot, t_park) # charge until SOC max, if parking time allows                   
+                P_charge = P_ch_nom*t_ch_nom/t_ch #charging for an integer number of minutes at the power equivalent to the one that would charge en_charge_tot without rounding
+                charge_start = park_start
+                charge_end = park_start + t_ch
+                power_usage[charge_start: charge_end] = P_charge
+                locational_load[location][charge_start:charge_end] += P_charge  #with the slice of the indexes [charge_start: charge_end+1] from charging.
+
+            delta_soc = power_usage / Battery_capacity_kW 
+            #update the SOC array for evaluating the next parking events
+            SOC = delta_soc
+            SOC[0] = self.SOC_init
+            SOC = np.cumsum(SOC)
+                
+        charging_power = np.sum(np.stack(list(locational_load.values())),axis=0)
+        
+        
+        #return charging power
+        # Create a boolean array: True if charging, False if not
+        is_charging = charging_power != 0
+
+        # Find where charging state changes
+        changes = np.diff(is_charging.astype(int))
+        starts = np.where(changes == 1)[0] + 1  # charging blocks start
+        ends = np.where(changes == -1)[0] + 1   # charging blocks end
+        charged_power = [power_usage[start:stop] for start, stop in zip(starts, ends)]
+
+        # Handle edge cases: starts at 0 or ends at last index
+        if is_charging[0]:
+            starts = np.insert(starts, 0, 0)
+        if is_charging[-1]:
+            ends = np.append(ends, len(is_charging))
+
+        lengths = ends - starts
+        
+        #metric functions [TO DELETE]
+        self.length_of_charging_sessions = np.append(self.length_of_charging_sessions,lengths)
+        charged_power_kwh = np.array([np.sum(sl) for sl in charged_power]) / 60 #kwh charged in the sessions.
+        self.kwh_per_charging_session.extend(charged_power_kwh)
+        self.charging_distribution.append(charging_power)
+        self.save_charging_power.append(charging_power)     #array with the charged power in a session
+        
+            
+        return charging_power, locational_load
+            
+    def time_based_charging(self,SOC, parking_location_intervals,power_usage, Battery_capacity_kW, infr_pr, Ch_stations, location_mapping):
+        locational_load = {location: np.zeros(len(power_usage), dtype=np.float32) for location in location_mapping.keys()}
+    
+        for park in range(0, len(parking_location_intervals)): 
+            if park == 0:
+                continue
+
+            park_start, park_end, location = parking_location_intervals[park]
+
+            # SOC at the beginning of the parking
+            SOC_park = SOC[park_start] #equal to SOC[park_ind[park][0]]
+
+            infr_probability = infr_pr[location][park_start]
+        
+            if SOC_park >= self.SOC_max:
+                continue
+            
+            ind_park_range = np.arange(park_start, park_end)
+            
+            try:  # Energy used in the following travel
+                next_travel_ind_range = np.arange(park_end, parking_location_intervals[park+1][0]) #distance between the end of this park and start of the next park
+                len_next_park =  parking_location_intervals[park+1][1] - parking_location_intervals[park+1][0] #check how long next park session is
+                if len_next_park < 10: 
+                    try:
+                        next_travel_ind_range = np.arange(parking_location_intervals[park][1], parking_location_intervals[park+2][0])
+                    except IndexError:
+                        pass
+                en_next_travel = abs(np.sum(power_usage[next_travel_ind_range]))#check how much energy is going to be used            
+            except IndexError: # If there is an index error means we are in the last parking, special case -> dummy days needed
+                en_next_travel = 0
+            
+            
+            residual_energy = Battery_capacity_kW*SOC_park  # Residual energy in the EV Battery
+            
+            # Control to check if the user can charge based on infrastructure 
+            # availability, SOC, time of the day (Depending on the options activated)
+            if (
+                (self.ch_prob(SOC_park) > np.random.rand() and
+                infr_probability > np.random.rand() and
+                self.charge_range_check(ind_park_range, self.charge_range) 
+                ) or 
+                (np.around(SOC_park, 2) <= self.SOC_min) 
+                or (np.floor(residual_energy) <= np.ceil(en_next_travel/self.eff))
+                ): 
+              
+                # Calculates the parking time
+                t_park = park_end -park_start               
+                
+                # Fills the array of plug in (1 = plugged, 0 = not plugged)
+                #plug_in[park_ind[park][0]:park_ind[park][1]] = 1
+                
+                if Ch_stations == None:
+                    P_ch_nom = self.mob.infrastructure_probability(location, park_start)
+                else:
+                    P_ch_nom = random.choices(Ch_stations[0], weights=Ch_stations[1])[0]
+                    
+
+                en_charge_tot = Battery_capacity_kW*(self.SOC_max - SOC_park)/self.eff
+                with np.errstate(divide='raise'):
+                    try: # Charging strategy for time based modes (Night charge, RES integration)
+                        charge_ind_range = np.intersect1d(ind_park_range, self.charge_range)
+                        
+                        # Minimum charging power (charging during night time)
+                        P_ch_min = min(en_charge_tot/len(charge_ind_range), P_ch_nom)
+                        np.put(power_usage, charge_ind_range, P_ch_min)
+                        charge_start = charge_ind_range[0]
+                        charge_end = charge_ind_range[-1]
+                        locational_load[location][charge_start:charge_end] += P_ch_min
+                    # if intersection array is empty means that we are in forced charging 
+                    # (SOC<0.2 / too low SOC residual), or in uncontrolled charging mode
+                    except (FloatingPointError, ZeroDivisionError): 
+                        t_ch_nom = min(en_charge_tot / P_ch_nom, t_park) # charging time with nominal power (float)
+                        t_ch_tot = int(- (en_charge_tot // -P_ch_nom)) # Fast way to perform the operation: int(math.ceil(en_charge_tot/P_ch_nom)) 
+                        t_ch = min(t_ch_tot, t_park) # charge until SOC max, if parking time allows                   
+                        P_charge = P_ch_nom*t_ch_nom/t_ch #charging for an integer number of minutes at the power equivalent to the one that would charge en_charge_tot without rounding
+                        charge_start = park_start
+                        charge_end = charge_start + t_ch
+                        power_usage[charge_start: charge_end] = P_charge
+                        locational_load[location][charge_start:charge_end] += P_charge  #with the slice of the indexes [charge_start: charge_end+1] from charging.
+
+            delta_soc = power_usage / Battery_capacity_kW 
+            SOC = delta_soc
+            SOC[0] = self.SOC_init
+            SOC = np.cumsum(SOC)
+                    
+        
+        charging_power = np.sum(np.stack(list(locational_load.values())),axis=0)
+        is_charging = charging_power != 0
+
+        # Find where charging state changes
+        changes = np.diff(is_charging.astype(int))
+        starts = np.where(changes == 1)[0] + 1  # charging blocks start
+        ends = np.where(changes == -1)[0] + 1   # charging blocks end
+        charged_power = [power_usage[start:stop] for start, stop in zip(starts, ends)]
+        
+
+        # Handle edge cases: starts at 0 or ends at last index
+        if is_charging[0]:
+            starts = np.insert(starts, 0, 0)
+        if is_charging[-1]:
+            ends = np.append(ends, len(is_charging))
+
+        # length of the charging event
+        lengths = ends - starts
+        
+        # Average length
+        #aantal elements in the lengths = aantal laadbeurten. Delen door len(self.usecase.days)
+        charged_power_kwh = np.array([np.sum(sl) for sl in charged_power]) / 60 #kwh charged in the sessions.
+        #charged_power_kwh_average = charged_power_kwh.sum()/len(charged_power_kwh) #average charged per session. 
+        
+        self.kwh_per_charging_session.extend(charged_power_kwh)
+        self.length_of_charging_sessions = np.append(self.length_of_charging_sessions,lengths)
+
+        self.charging_distribution.append(charging_power)
+        self.save_charging_power.append(charging_power)     #array with the charging power
+        
+        return charging_power, locational_load
+
+        
+    def perfect_foresight(self, SOC, parking_location_intervals, power_usage, Battery_capacity_kW, infr_pr, Ch_stations, location_mapping):
+        # Initialise value for perfect foresight charging mode and plan-day-ahead
+        en_to_charge = 0 
+        locational_load = {location: np.zeros(len(power_usage), dtype=np.float32) for location in location_mapping.keys()}
+
+        for park in range(0, len(parking_location_intervals)): 
+            # SOC at the beginning of the parking
+            
+            park_start, park_end, location = parking_location_intervals[park]
+
+            SOC_park = SOC[park_start] #equal to SOC[park_ind[park][0]]
+
+            infr_probability = infr_pr[location][park_start]
+
+            #print(f'park {park} for park_index {park_ind[park]} with SOC {SOC_park}')
+            if SOC_park >= self.SOC_max:
+                continue
+            else:
+                pass 
+                
+            ind_park_range = 1
+
+            try:  # Energy used in the following travel
+                next_travel_ind_range = np.arange(park_end, parking_location_intervals[park+1][0]) #distance between the end of this park and start of the next park
+                len_next_park =  parking_location_intervals[park+1][1] - parking_location_intervals[park+1][0] #check how long next park session is
+                if len_next_park < 10: 
+                    try:
+                        next_travel_ind_range = np.arange(parking_location_intervals[park][1], parking_location_intervals[park+2][0])
+                    except IndexError:
+                        pass
+                en_next_travel = abs(np.sum(power_usage[next_travel_ind_range]))#check how much energy is going to be used            
+            except IndexError: # If there is an index error means we are in the last parking, special case -> dummy days needed
+                en_next_travel = 0
+                
+            en_charge_tot = (en_next_travel + en_to_charge)/self.eff
+        
+
+            if en_charge_tot < 0.1:
+                continue
+
+            if park == len(parking_location_intervals):
+                en_charge_tot = 0
+            
+            residual_energy = Battery_capacity_kW*SOC_park  # Residual energy in the EV Battery
+
+            # Control to check if the user can charge based on infrastructure 
+            # availability, SOC, time of the day (Depending on the options activated)
+            if (
+                (self.ch_prob(SOC_park) > random.random() and
+                infr_probability > random.random() and
+                self.charge_range_check(ind_park_range, self.charge_range)
+                ) or 
+                (np.around(SOC_park, 2) <= self.SOC_min) or
+                (np.floor(residual_energy) <= np.ceil(en_next_travel/self.eff))
+                ): 
+         
+                # Calculates the parking time
+                t_park = park_end - park_start
+                if t_park == 0: #there are cases that RAMP produces a switch-on time of 1, resulting in a division error. Thus set to 1 to prevent the calculation error.
+                    t_park = 1                  
+                
+                # Fills the array of plug in (1 = plugged, 0 = not plugged)
+                #plug_in[park_ind[park][0]:park_ind[park][1]] = 1
+                
+                if Ch_stations == None:
+                    P_ch_nom = self.mob.infrastructure_probability(location, park_start)
+                else:
+                    P_ch_nom = random.choices(Ch_stations[0], weights=Ch_stations[1])[0]
+                    
+                
+                t_ch_nom = min(en_charge_tot / P_ch_nom, t_park) # charging time with nominal power (float)
+                t_ch_tot = int(- (en_charge_tot // -P_ch_nom)) # Fast way to perform the operation:   int(math.ceil(en_charge_tot/P_ch_nom)) 
+                t_ch = min(t_ch_tot, t_park) # charge until SOC max, if parking time allows                   
+                P_charge = P_ch_nom*t_ch_nom/t_ch #charging for an integer number of minutes at the power equivalent to the one that would charge en_charge_tot without rounding
+                charge_end = park_end
+                charge_start = charge_end - t_ch
+                power_usage[charge_start: charge_end+1] = P_charge
+                en_to_charge = en_charge_tot - (t_ch * P_charge)
+                locational_load[location][charge_start:charge_end] += P_charge #with the slice of the indexes [charge_start: charge_end+1] from charging.
+
+            
+            else: # if the user does not charge, then the energy consumed will be charged in a following parking                         
+                en_to_charge = en_charge_tot
+
+                delta_soc = power_usage / Battery_capacity_kW 
+                SOC = delta_soc
+                SOC[0] = self.SOC_init
+                SOC = np.cumsum(SOC)
+            
+        charging_power = np.where(power_usage<0, 0, power_usage) # Filtering only for the charging power            
+        
+        self.charging_distribution.append(charging_power)
+        self.save_charging_power.append(charging_power)     #array with the charging power  
+                
+        return charging_power, locational_load
+       
+    def charging_process(self, 
+                         SOC_max,
+                         SOC_min, 
+                         SOC_min_rand, 
+                         SOC_initial,
+                         infr_pr,
+                         ch_prob,
+                         country, 
+                         minutes,
+                         eff,
+                         charging_location_preference,
+                         user_num,
+                         charging_mode,
+                         Ch_stations = ([3.7, 11, 120], [0.6, 0.3, 0.1])
+                         ):
+        
+        self.SOC_max = SOC_max
+        self.SOC_min = SOC_min
+        self.ch_prob = ch_prob
+        self.eff = eff
+        self.charging_location_preference = charging_location_preference
+    
+        # retrieve the total mobility profile based on user id: the concatenated daily_usage profiles of size 1440*days and compress to float32 type for performance 
+        days_sequence = self.EV_usage_total_days[user_num].astype(np.float32)
+        
+        # get the parking indexes to evaluate parking times
+        travel_intervals, park_ind = self.get_parking_indexes(days_sequence)
+
+        #for flexible mapping for locations: needs access to the dictionary that stores the Location_share.
+        # something like {k:i for i,k in enumerate(self.mobility.location_dict.keys())} -> here are the possible locatiosn defined.
+        # in one file to safeguard consistency between specified locations.
+        location_mapping = {'Home':1,'Work/Study':2,'Leisure':3,'Errands':4}
+
+        #calculate the locations based on movement during the day
+        parking_location_intervals = self.update_location(user_num,travel_intervals, park_ind)
+        
+        #sets to power consumed by the car to negative values
+        power_usage = np.where(days_sequence > 0, -days_sequence, 0)
+        power_usage = power_usage / 1000 #from Watt (W) to kiloWatt (kW)
+        
+        Battery_capacity_kW = self.battery_capacity * 60  # Capacity multiplied by 60 to evaluate the capacity in kWmin
+        #Variation of SOC for each minute, 
+        delta_soc = power_usage / Battery_capacity_kW #how much per minute gets depleted
+        
+        #Control rountine on the Initial SOC value
+        if SOC_initial == 'random': #function to select random value
+            SOC_init = self.mob.SOC_initial_f(SOC_max, SOC_min_rand)
+            self.SOC_init = SOC_init           
+        elif isinstance(SOC_initial, (int, float)): # If initial SOC is a number, that will be the initial SOC
+            SOC_init = self.mob.SOC_initial_f_const(SOC_initial)
+            self.SOC_init = SOC_init 
+        
+         # Calculation of the SOC array
+        SOC = delta_soc
+        SOC[0] = SOC_init
+        SOC = np.cumsum(SOC)
+
+        if self._charging_strategy is not None:
+            charging_mode = self._charging_strategy
+        
+        # Definition of range in which the charging is shifted
+        if charging_mode == 'Night Charge':
+            self.charge_range = minutes.indexer_between_time('22:00', '7:00', include_start=True, include_end=False)
+            self.charge_range_check = self.mob.charge_check_smart
+        elif charging_mode == "RES Integration":
+            read_residual_load_data = self.mob.residual_load_data
+            self.charge_range = self.mob.residual_load(minutes, read_residual_load_data, 2016, country)
+            self.charge_range_check = self.mob.charge_check_smart
+        else: 
+            self.charge_range = 0
+            self.charge_range_check = self.mob.charge_check_normal
+        
+        charging_mode_mapping = {   'Uncontrolled': self.uncontrolled, 
+                                    'Night Charge':self.time_based_charging, 
+                                    'RES Integration':self.time_based_charging, 
+                                    'Perfect Foresight':self.perfect_foresight,
+                                    'Plan-day-ahead':self.plan_day_ahead}
+
+        single_charging_profile, locational_charging_profiles = charging_mode_mapping[charging_mode](
+            SOC, parking_location_intervals, power_usage, Battery_capacity_kW, infr_pr, Ch_stations, location_mapping,
+        )
+        
+        return single_charging_profile, locational_charging_profiles
+
+        
+        
+
+        

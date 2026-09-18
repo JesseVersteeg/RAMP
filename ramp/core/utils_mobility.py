@@ -37,7 +37,7 @@ infrastructure_per_location_data = pd.read_excel(infrastructure_per_location_fil
 
 infra_availability_file = inputfolder/"availability_infrastructure.xlsx"
 infra_availability_data = pd.read_excel(infra_availability_file, index_col=[0,1])
-#print(infra_availability_data)
+
 
 class MobilityCalendar:
     def __init__(self, country: str, year: int):
@@ -167,8 +167,6 @@ def load_mobility_data_country(country):
             #store as np.array into dictionary for look up
             temperature_lookup[day] = correction.astype(np.float32)
           
-        
-
         # Location 
         location_file = inputfolder/f'location_share_{country}.csv'
         location_data = pd.read_csv(location_file,  sep=';', decimal=',', encoding='utf-8', header=0, skiprows=[1,2])
@@ -437,6 +435,3 @@ def tot_battery_cap_calc(User_list):
         tot_cap_users = sum(cap_users.values())
     
     return tot_cap_users
-
-
-#load_mobility_data_country('NL')

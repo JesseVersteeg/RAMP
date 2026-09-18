@@ -14,7 +14,7 @@ def switch_on_parameters():
     """
 
     mu_peak = 0.5  # median value of gaussian distribution [0,1] by which the number of coincident switch_ons is randomly selected
-    s_peak = 0.5  # standard deviation (as percentage of the median value) of the gaussian distribution [0,1] above mentioned
+    s_peak = 1  # standard deviation (as percentage of the median value) of the gaussian distribution [0,1] above mentioned
     op_factor = 0.5  # off-peak coincidence calculation parameter
 
     return mu_peak, s_peak, op_factor
@@ -103,22 +103,22 @@ APPLIANCE_ATTRIBUTES = (
     "window_1",
     "window_2",
     "window_3",
-    "random_var_w",
-    "car_type",
-    "user_type",
-    "distance_total",
-    "distance_random_variability",
-    "velocity_random_variability",
-    "power_random_variability",
-    "distance_minimal",
-    "power_variables",
-    "parameters_power",
-    "battery_capacity",
-    "location",
-    "location_preference_factor",
-    "electric_vehicle",
-    "minimum_waiting_time",
-    "charging_strategy",
+    "random_var_w",                     #EV_specific PARAMS
+    "car_type",                         #EV_specific PARAMS
+    "user_type",                        #EV_specific PARAMS
+    "distance_total",                   #EV_specific PARAMS
+    "distance_random_variability",      #EV_specific PARAMS
+    "velocity_random_variability",      #EV_specific PARAMS
+    "power_random_variability",         #EV_specific PARAMS
+    "distance_minimal",                 #EV_specific PARAMS
+    "power_variables",                  #EV_specific PARAMS
+    "parameters_power",                 #EV_specific PARAMS
+    "battery_capacity",                 #EV_specific PARAMS    
+    "location",                         #EV_specific PARAMS
+    "location_preference_factor",       #EV_specific PARAMS
+    "electric_vehicle",                 #EV_specific PARAMS
+    "minimum_waiting_time",             #EV_specific PARAMS
+    "charging_strategy",                #EV_specific PARAMS
 )
 
 APPLIANCE_ARGS = (
@@ -138,21 +138,25 @@ APPLIANCE_ARGS = (
     "pref_index",
     "wd_we_type",
     "name",
+
+)
+EV_SPECIFIC_PARAMS = (
     "car_type",
-    "user_type",
     "distance_total",
     "distance_random_variability",
     "velocity_random_variability",
     "power_random_variability",
-    "distance_minimal",
-    "power_variables",
-    "parameters_power",
+    "power_parameters",
     "battery_capacity",
-    "location",
-    "location_preference_factor",
     "electric_vehicle",
-    "minimum_waiting_time",
-    "charging_strategy"
+    "user_type",                        #EV_specific PARAMS
+    "distance_minimal",                 #EV_specific PARAMS
+    "power_variables",                  #EV_specific PARAMS
+    "parameters_power",                 #EV_specific PARAMS
+    "location",                         #EV_specific PARAMS
+    "location_preference_factor",       #EV_specific PARAMS
+    "minimum_waiting_time",             #EV_specific PARAMS
+    "charging_strategy"                 #EV_specific PARAMS  # backwards compatability, optional
 )
 
 MAX_WINDOWS = 3

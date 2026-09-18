@@ -55,17 +55,241 @@ def Profile_series_plot(stoch_profiles_series):
     # x = np.arange(0,1440,5)
     plt.figure(figsize=(10, 5))
     plt.plot(np.arange(len(stoch_profiles_series)), stoch_profiles_series, "#4169e1")
-    # plt.xlabel('Time (hours)')
+    plt.xlabel('Time (minutes)')
     plt.ylabel("Power (W)")
     plt.ylim(ymin=0)
-    # plt.ylim(ymax=5000)
+    #plt.ylim(ymax=14000)
     plt.margins(x=0)
     plt.margins(y=0)
     # plt.xticks([0,240,480,(60*12),(60*16),(60*20),(60*24)],[0,4,8,12,16,20,24])
     # plt.savefig('profiles.eps', format='eps', dpi=1000)
     plt.show()
 
+#temporary function to shave off the dummy days that are used to for warm-up and cooldown time of the model
+def Charging_series_dummy_days(stoch_profiles_series, days):
+    dummy_days = 2
+    dummy_minutes = dummy_days * 1440
+    stoch_profiles_capped = stoch_profiles_series[dummy_minutes:-dummy_minutes]
 
+    # start_plot = days[2].strftime('%Y-%m-%d 00:00')
+    # time_index = pd.date_range(start=start_plot, periods=len(stoch_profiles_capped), freq='min')
+    # plt.figure(figsize=(10, 5))
+    # plt.plot(time_index, stoch_profiles_capped, "green")
+    
+    # plt.xticks(rotation=90)
+    # plt.ylabel('Power [kW]', fontsize = 10)
+    # plt.title("Charging Demand Profile", fontsize = 10)
+    # plt.tight_layout()
+    # plt.grid(False)
+    # plt.show()
+    return stoch_profiles_capped
+
+def Charging_cloud_plot(stoch_profiles):
+    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+
+    reshaped_charging = stoch_profiles.reshape((len(stoch_profiles) // 1440, 1440))
+    Charge_avg = np.mean(reshaped_charging, axis=0)
+
+    x = np.arange(1440)  # x-axis in minutes
+
+    # Plot individual profiles
+    for profile in reshaped_charging:
+        ax.plot(x, profile, color="#c6e1cd", linewidth=1, alpha=0.5)
+
+    # Plot average profile
+    ax.plot(x, Charge_avg, color="#20792d", linewidth=2)
+
+    # Format axes
+    ax.set_xlabel("Time (hours)")
+    ax.set_ylabel("Power (kW)")
+    ax.set_ylim(bottom=0)
+    ax.set_xlim(left=0, right=1440)
+
+    # Set x-axis ticks at every 4 hours
+    ax.set_xticks([0, 240, 480, 720, 960, 1200, 1440])
+    ax.set_xticklabels([0, 4, 8, 12, 16, 20, 24])
+
+    plt.tight_layout()
+    plt.show()
+
+def plot_traveling_share(travel_share, days):
+    """
+    Parameters
+    ----------
+    travel_share : np.ndarray
+        Array of length days*1440 containing the share of EVs traveling
+        at every minute (0-1).
+
+    days : pd.DatetimeIndex
+        Simulation days.
+    """
+
+    # convert to percentage
+    travel_percentage = travel_share * 100
+
+    plt.figure(figsize=(12, 6))
+
+    plt.plot(
+        np.arange(len(travel_percentage)),
+        travel_percentage,
+        linewidth=1,
+        color='orange'
+    )
+
+    # day ticks
+    xticks = np.arange(0, len(travel_percentage), 1440)
+    plt.xticks(xticks, days.strftime('%d-%m'))
+
+    plt.grid(axis='x', linestyle='--')
+    plt.grid(alpha=0.3)
+
+    plt.title('Usage Profile')
+    plt.xlabel('Day')
+    plt.ylabel('Traveling vehicles [% of total users]')
+
+    plt.tight_layout()
+    plt.show()
+
+
+def Location_mobility_stacked(location_profiles, days):
+
+    LOCATION_ORDER = [
+        "Home",
+        "Work/Study",
+        "Errands",
+        "Leisure",
+        "traveling"
+    ]
+
+    total_minutes = location_profiles.shape[0]
+
+    location_counts = np.stack([np.sum(location_profiles == loc_id, axis=1)for loc_id in range(len(LOCATION_ORDER))],axis=1)
+    location_counts = (location_counts /location_counts.sum(axis=1, keepdims=True))
+
+    plt.figure(figsize=(12, 6))
+
+    plt.stackplot(
+        np.arange(total_minutes),
+        location_counts.T,
+        labels=LOCATION_ORDER
+    )
+
+    xticks = np.arange(0, total_minutes, 1440)
+    plt.xticks(xticks, days.strftime('%d-%m'))
+
+    plt.grid(axis='x', linestyle='--')
+
+    plt.title("Vehicle Location Over Time")
+    plt.xlabel("Days")
+    plt.ylabel("Share [-]")
+
+    plt.legend(
+        title="Location",
+        bbox_to_anchor=(1.05, 1),
+        loc='upper left'
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+def plot_locational_load_stacked(locational_load, days=None):
+
+    locations = list(locational_load.keys())
+
+    profiles = np.vstack([
+        locational_load[loc]
+        for loc in locations
+    ])
+
+    T = profiles.shape[1]
+
+    plt.figure(figsize=(12, 6))
+
+    plt.stackplot(
+        np.arange(T),
+        profiles,
+        labels=locations
+    )
+
+    if days is not None:
+        xticks = np.arange(0, T, 1440)
+        plt.xticks(xticks, days.strftime('%d-%m'))
+
+    plt.grid(axis='x', linestyle='--')
+    plt.xlabel("Time")
+    plt.ylabel("Charging Power [kW]")
+    plt.title("Locational Charging Demand")
+    plt.legend(loc='upper left', bbox_to_anchor=(1.05, 1))
+    plt.tight_layout()
+    plt.show()
+
+def location_curves_non_stacked(loc_df):#, days):
+    location_counts = loc_df.apply(lambda row: row.value_counts(), axis=1).fillna(0)
+    location_counts = location_counts.drop(labels='traveling', axis=1)
+
+    # Step 2: Convert counts to percentages
+    percentage_df = location_counts.div(loc_df.shape[1], axis=0) * 100
+
+    # Step 3: Plot the percentage per location over time
+    plt.figure(figsize=(14, 6))
+    for location in percentage_df.columns:
+        plt.plot(percentage_df.index, percentage_df[location], label=location, linewidth=0.8)
+
+    plt.ylabel('Percentage of Vehicles (%)')
+    plt.xlabel('Time (minutes)')
+    plt.title('Percentage of Vehicles at Each Location Over Time')
+    plt.legend(title='Location')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+#temporary metric function
+def Car_trips_distribution(counter):
+    distribution_trips = {}
+    for day, Counter in counter.items():
+        total = sum(counter[day].values())
+        distribution_trips[day]= {k: round((v/total)*100) for k,v in Counter.items()}
+    
+    #individual days
+    key_trip = []
+    value_trip = []
+    for counter_dict in distribution_trips.values():
+        if 0 in counter_dict.keys():
+            del counter_dict[0]
+        counter_sorted = sorted(counter_dict.items()) 
+        x,y = zip(*counter_sorted)
+        key_trip.append(x)
+        value_trip.append(y)
+
+    #mean
+    travel_keys_mean = {}
+    counts_mean = {}
+
+    for day_dict in distribution_trips.values():
+        for k, v in day_dict.items():
+            travel_keys_mean[k] = travel_keys_mean.get(k, 0) + v
+            counts_mean[k] = counts_mean.get(k, 0) + 1
+
+    means = {k: round(travel_keys_mean[k] / counts_mean[k]) for k in travel_keys_mean}
+    means_sorted = dict(sorted(means.items()))
+    if 0 in means_sorted.keys():
+        del means_sorted[0]
+    
+    plt.figure(figsize=(10, 5))
+    
+    for x,y in zip(key_trip,value_trip):
+        plt.scatter(x,y, color='grey')
+    plt.scatter(means_sorted.keys(), means_sorted.values(), color='red')
+    plt.xlabel('Amount of travels per day')
+    plt.ylabel('Percentage (%)')
+    plt.title('Mean of amount of travels per day')
+    plt.xticks(list(means_sorted.keys()))
+    plt.tight_layout()
+    plt.grid(True)
+    plt.show()
 # Export individual profiles
 """
 for i in range (len(Profile)):
@@ -73,7 +297,24 @@ for i in range (len(Profile)):
 """
 
 # Export Profiles
+def export_stacked_data_to_csv(
+    locational_profiles,
+    reference_array=None,
+    filename='individual_location_profiles'
+):
 
+    df = pd.DataFrame(locational_profiles)
+
+    if reference_array is not None:
+        df['Reference_Total'] = reference_array
+
+    path_to_write = os.path.join(
+        BASE_PATH,
+        "results",
+        f'output_file_{os.path.split(filename)[-1].replace(".", "_")}.csv',
+    )
+
+    df.to_csv(path_to_write, index=False)
 
 def export_series(stoch_profiles_series, j=None, fname=None, ofname=None):
     series_frame = pd.DataFrame(stoch_profiles_series)
@@ -117,7 +358,7 @@ valid_units = ("kW", "W", "MW", "GW", "TW")
 
 class Plot:
     """
-    The Plot class will provide useful fucntionalities for analyzing and visualizing the results of one or multiple ramp simulations.
+    The Plot class will provide useful functionalities for analyzing and visualizing the results of one or multiple ramp simulations.
 
     The Plot class will store ramp simulation into a pd.DataFrame with timeseries index, representign the timeline of the simulation and the columns representing the simulated cases.
     A Plot class can be initialized using a pd.DataFrame, or from a csv, or xlsx file.
